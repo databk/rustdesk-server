@@ -864,12 +864,17 @@ impl RendezvousServer {
                     peer_addr,
                     addr
                 );
+                // If the target peer registered via TCP/WS (e.g. disable-udp enabled),
+                // it cannot do UDP hole punching, so force relay.
+                let peer_addr_v4 = try_into_v4(peer_addr);
+                let target_is_tcp_ws = self.ws_map.lock().await.get(&peer_addr_v4).is_some()
+                    || self.tcp_map.lock().await.get(&peer_addr_v4).is_some();
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
                     udp_port: ph.udp_port,
-                    force_relay: ph.force_relay,
+                    force_relay: ph.force_relay || target_is_tcp_ws,
                     ..Default::default()
                 });
             }
