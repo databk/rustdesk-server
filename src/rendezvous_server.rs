@@ -347,84 +347,22 @@ impl RendezvousServer {
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
-                    if id.len() < 6 {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                    } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                    match self.validate_register_pk(&id, &rk.uuid, &rk.pk, &ip).await {
+                        Ok((peer, changed, _ip_changed)) => {
+                            if changed {
+                                self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
                             }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
-                            )
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_register_pk_response(RegisterPkResponse {
+                                result: register_pk_response::Result::OK.into(),
+                                ..Default::default()
+                            });
+                            socket.send(&msg_out, addr).await?
                         }
-                    };
-                    let mut req_pk = peer.read().await.reg_pk;
-                    if req_pk.1.elapsed().as_secs() > 6 {
-                        req_pk.0 = 0;
-                    } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
-                    }
-                    req_pk.0 += 1;
-                    req_pk.1 = Instant::now();
-                    peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
-                        let mut lock = IP_CHANGES.lock().await;
-                        if let Some((tm, ips)) = lock.get_mut(&id) {
-                            if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                *tm = Instant::now();
-                                ips.clear();
-                                ips.insert(ip.clone(), 1);
-                            } else if let Some(v) = ips.get_mut(&ip) {
-                                *v += 1;
-                            } else {
-                                ips.insert(ip.clone(), 1);
-                            }
-                        } else {
-                            lock.insert(
-                                id.clone(),
-                                (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                            );
+                        Err(msg_out) => {
+                            socket.send(&msg_out, addr).await?
                         }
                     }
-                    if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-                    }
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: register_pk_response::Result::OK.into(),
-                        ..Default::default()
-                    });
-                    socket.send(&msg_out, addr).await?
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     if self.pm.is_in_memory(&ph.id).await {
@@ -561,15 +499,18 @@ impl RendezvousServer {
                         res.cu = MessageField::from_option(Some(cu));
                     }
                     msg_out.set_test_nat_response(res);
-                    if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
+                    let addr_v4 = try_into_v4(addr);
+                    let sink_arc = self.ws_map.lock().await.get(&addr_v4).cloned();
+                    if let Some(sink_arc) = sink_arc {
+                        let mut ws_sink = sink_arc.lock().await;
+                        Self::send_to_sink(&mut *ws_sink, msg_out).await;
+                    } else if let Some(s) = sink.as_mut() {
+                        Self::send_to_sink(s, msg_out).await;
+                    }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     if !ws {
-                        let mut msg_out = RendezvousMessage::new();
-                        msg_out.set_register_pk_response(RegisterPkResponse {
-                            result: register_pk_response::Result::NOT_SUPPORT.into(),
-                            ..Default::default()
-                        });
+                        let msg_out = Self::make_register_pk_response(register_pk_response::Result::NOT_SUPPORT);
                         if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
                     } else {
                         // WebSocket clients need full registration
@@ -578,130 +519,61 @@ impl RendezvousServer {
                         }
                         let id = rk.id.clone();
                         let ip = addr.ip().to_string();
-                        if id.len() < 6 {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_pk_response(RegisterPkResponse {
-                                result: UUID_MISMATCH.into(),
-                                ..Default::default()
-                            });
-                            if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
-                            return false;
-                        } else if !self.check_ip_blocker(&ip, &id).await {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_pk_response(RegisterPkResponse {
-                                result: TOO_FREQUENT.into(),
-                                ..Default::default()
-                            });
-                            if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
-                            return false;
-                        }
-                        let peer = self.pm.get_or(&id).await;
-                        let (changed, ip_changed) = {
-                            let peer = peer.read().await;
-                            if peer.uuid.is_empty() {
-                                (true, false)
-                            } else {
-                                if peer.uuid == rk.uuid {
-                                    if peer.info.ip != ip && peer.pk != rk.pk {
-                                        log::warn!(
-                                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                            id, ip, rk.pk, peer.info.ip, peer.pk,
-                                        );
-                                        drop(peer);
-                                        let mut msg_out = RendezvousMessage::new();
-                                        msg_out.set_register_pk_response(RegisterPkResponse {
-                                            result: UUID_MISMATCH.into(),
-                                            ..Default::default()
-                                        });
-                                        if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
-                                        return false;
-                                    }
-                                } else {
-                                    log::warn!(
-                                        "Peer {} uuid mismatch: {:?} vs {:?}",
-                                        id, rk.uuid, peer.uuid
-                                    );
-                                    drop(peer);
-                                    let mut msg_out = RendezvousMessage::new();
-                                    msg_out.set_register_pk_response(RegisterPkResponse {
-                                        result: UUID_MISMATCH.into(),
-                                        ..Default::default()
-                                    });
-                                    if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
-                                    return false;
+                        match self.validate_register_pk(&id, &rk.uuid, &rk.pk, &ip).await {
+                            Ok((peer, changed, _ip_changed)) => {
+                                // Always update for WS peers: socket_addr must reflect the
+                                // current WS connection address even when key/uuid unchanged
+                                if changed || ws {
+                                    self.pm.update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip).await;
                                 }
-                                let ip_changed = peer.info.ip != ip;
-                                (
-                                    peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                    ip_changed,
-                                )
+                                // Ensure socket_addr and last_reg_time are always up-to-date
+                                if let Some(p) = self.pm.get_in_memory(&id).await {
+                                    let mut p = p.write().await;
+                                    p.socket_addr = addr;
+                                    p.last_reg_time = Instant::now();
+                                }
+                                let msg_out = Self::make_register_pk_response(register_pk_response::Result::OK);
+                                if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
+                                // Store WS sink in ws_map for later message delivery
+                                if let Some(s) = sink.take() {
+                                    self.ws_map.lock().await.insert(try_into_v4(addr), Arc::new(Mutex::new(s)));
+                                }
+                                return true;
                             }
-                        };
-                        let mut req_pk = peer.read().await.reg_pk;
-                        if req_pk.1.elapsed().as_secs() > 6 {
-                            req_pk.0 = 0;
-                        } else if req_pk.0 > 2 {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_pk_response(RegisterPkResponse {
-                                result: TOO_FREQUENT.into(),
-                                ..Default::default()
-                            });
-                            if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
-                            return false;
-                        }
-                        req_pk.0 += 1;
-                        req_pk.1 = Instant::now();
-                        peer.write().await.reg_pk = req_pk;
-                        if ip_changed {
-                            let mut lock = IP_CHANGES.lock().await;
-                            if let Some((tm, ips)) = lock.get_mut(&id) {
-                                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
-                                    *tm = Instant::now();
-                                    ips.clear();
-                                    ips.insert(ip.clone(), 1);
-                                } else if let Some(v) = ips.get_mut(&ip) {
-                                    *v += 1;
-                                } else {
-                                    ips.insert(ip.clone(), 1);
-                                }
-                            } else {
-                                lock.insert(
-                                    id.clone(),
-                                    (Instant::now(), HashMap::from([(ip.clone(), 1)])),
-                                );
+                            Err(msg_out) => {
+                                if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
+                                return false;
                             }
                         }
-                        // Always update for WS peers: socket_addr must reflect the
-                        // current WS connection address even when key/uuid unchanged
-                        if changed || ws {
-                            self.pm.update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip).await;
-                        }
-                        // Ensure socket_addr and last_reg_time are always up-to-date
-                        if let Some(p) = self.pm.get_in_memory(&id).await {
-                            let mut p = p.write().await;
-                            p.socket_addr = addr;
-                            p.last_reg_time = Instant::now();
-                        }
-                        let mut msg_out = RendezvousMessage::new();
-                        msg_out.set_register_pk_response(RegisterPkResponse {
-                            result: register_pk_response::Result::OK.into(),
-                            ..Default::default()
-                        });
-                        if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
-                        // Store WS sink in ws_map for later message delivery
-                        if let Some(s) = sink.take() {
-                            self.ws_map.lock().await.insert(try_into_v4(addr), Arc::new(Mutex::new(s)));
-                        }
-                        return true;
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPeer(rp)) if ws => {
                     // WebSocket peer heartbeat — update socket_addr and last_reg_time
+                    // with the same security check as UDP update_addr:
+                    // if peer has a public key and IP changed, require re-registration via RegisterPk
                     if !rp.id.is_empty() {
                         if let Some(p) = self.pm.get_in_memory(&rp.id).await {
-                            let mut p = p.write().await;
-                            p.socket_addr = addr;
-                            p.last_reg_time = Instant::now();
+                            let (request_pk, ip_change) = {
+                                let p = p.read().await;
+                                let ip = addr.ip();
+                                let ip_change = if p.socket_addr.port() != 0 {
+                                    ip != p.socket_addr.ip()
+                                } else {
+                                    ip.to_string() != p.info.ip
+                                } && !ip.is_loopback();
+                                let request_pk = p.pk.is_empty() || ip_change;
+                                (request_pk, ip_change)
+                            };
+                            if !request_pk {
+                                let mut p = p.write().await;
+                                p.socket_addr = addr;
+                                p.last_reg_time = Instant::now();
+                            } else if ip_change {
+                                log::info!(
+                                    "WS peer {} IP changed, requiring re-registration",
+                                    rp.id
+                                );
+                            }
                         }
                     }
                     return true;
@@ -1100,6 +972,90 @@ impl RendezvousServer {
             }
         }
         Ok(())
+    }
+
+    fn make_register_pk_response(result: register_pk_response::Result) -> RendezvousMessage {
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_register_pk_response(RegisterPkResponse {
+            result: result.into(),
+            ..Default::default()
+        });
+        msg_out
+    }
+
+    /// Validates a RegisterPk request. Returns Ok((peer, changed, ip_changed)) on success,
+    /// or Err(response_message) on validation failure.
+    /// Side effects: updates reg_pk rate limiting and IP_CHANGES tracking on success.
+    async fn validate_register_pk(
+        &self,
+        id: &str,
+        uuid: &[u8],
+        pk: &[u8],
+        ip: &str,
+    ) -> Result<(LockPeer, bool, bool), RendezvousMessage> {
+        if id.len() < 6 {
+            return Err(Self::make_register_pk_response(UUID_MISMATCH));
+        }
+        if !self.check_ip_blocker(ip, id).await {
+            return Err(Self::make_register_pk_response(TOO_FREQUENT));
+        }
+        let peer = self.pm.get_or(id).await;
+        let (changed, ip_changed) = {
+            let peer = peer.read().await;
+            if peer.uuid.is_empty() {
+                (true, false)
+            } else {
+                if peer.uuid == uuid {
+                    if peer.info.ip != ip && peer.pk != pk {
+                        log::warn!(
+                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
+                            id, ip, pk, peer.info.ip, peer.pk,
+                        );
+                        return Err(Self::make_register_pk_response(UUID_MISMATCH));
+                    }
+                } else {
+                    log::warn!(
+                        "Peer {} uuid mismatch: {:?} vs {:?}",
+                        id, uuid, peer.uuid
+                    );
+                    return Err(Self::make_register_pk_response(UUID_MISMATCH));
+                }
+                let ip_changed = peer.info.ip != ip;
+                (
+                    peer.uuid != uuid || peer.pk != pk || ip_changed,
+                    ip_changed,
+                )
+            }
+        };
+        let mut req_pk = peer.read().await.reg_pk;
+        if req_pk.1.elapsed().as_secs() > 6 {
+            req_pk.0 = 0;
+        } else if req_pk.0 > 2 {
+            return Err(Self::make_register_pk_response(TOO_FREQUENT));
+        }
+        req_pk.0 += 1;
+        req_pk.1 = Instant::now();
+        peer.write().await.reg_pk = req_pk;
+        if ip_changed {
+            let mut lock = IP_CHANGES.lock().await;
+            if let Some((tm, ips)) = lock.get_mut(id) {
+                if tm.elapsed().as_secs() > IP_CHANGE_DUR {
+                    *tm = Instant::now();
+                    ips.clear();
+                    ips.insert(ip.to_owned(), 1);
+                } else if let Some(v) = ips.get_mut(ip) {
+                    *v += 1;
+                } else {
+                    ips.insert(ip.to_owned(), 1);
+                }
+            } else {
+                lock.insert(
+                    id.to_owned(),
+                    (Instant::now(), HashMap::from([(ip.to_owned(), 1)])),
+                );
+            }
+        }
+        Ok((peer, changed, ip_changed))
     }
 
     async fn check_ip_blocker(&self, ip: &str, id: &str) -> bool {
