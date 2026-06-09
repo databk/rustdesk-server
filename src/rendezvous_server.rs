@@ -1387,25 +1387,30 @@ impl RendezvousServer {
         });
     }
 
+    /// Perform secure_tcp handshake for non-WS TCP connections.
+    /// Returns (encrypt, first_message):
+    /// - encrypt: Some if handshake succeeded, None if no server key or fallback
+    /// - first_message: Some(bytes) if client sent a non-KeyExchange response (fallback mode)
     async fn secure_tcp_handshake(
         &self,
         framed: &mut Framed<TcpStream, BytesCodec>,
-    ) -> ResultType<Option<Encrypt>> {
+    ) -> ResultType<(Option<Encrypt>, Option<BytesMut>)> {
         let sign_sk = match &self.inner.sk {
             Some(sk) => sk,
-            None => return Ok(None),
+            None => return Ok((None, None)),
         };
 
         // Generate box_ keypair for this connection
-        let (server_box_pk, server_box_sk) = box_::gen_keypair();
+        let (_server_box_pk, server_box_sk) = box_::gen_keypair();
 
         // Sign the box_ public key with the server's sign secret key
-        let signed_pk = sign::sign(server_box_pk.as_ref(), sign_sk);
+        let signed_pk = sign::sign(_server_box_pk.as_ref(), sign_sk);
 
-        // Send KeyExchange message
+        // Send KeyExchange message: only the signed public key
+        // Client extracts the box_ public key via sign::verify(&keys[0], &server_pk)
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_key_exchange(KeyExchange {
-            keys: vec![signed_pk.into(), server_box_pk.as_ref().to_vec().into()],
+            keys: vec![signed_pk.into()],
             ..Default::default()
         });
         let bytes = msg_out.write_to_bytes()?;
@@ -1418,24 +1423,34 @@ impl RendezvousServer {
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
                     if let Some(rendezvous_message::Union::KeyExchange(ke)) = msg_in.union {
                         if ke.keys.len() >= 2 {
-                            let symmetric_data = &ke.keys[0];
-                            let client_box_pk_bytes = &ke.keys[1];
+                            // Client sends: keys[0] = client's temporary public key
+                            //                keys[1] = encrypted symmetric key
+                            let client_box_pk_bytes = &ke.keys[0];
+                            let symmetric_data = &ke.keys[1];
                             match Encrypt::decode(symmetric_data, client_box_pk_bytes, &server_box_sk) {
                                 Ok(key) => {
                                     log::debug!("secure_tcp handshake completed");
-                                    return Ok(Some(Encrypt::new(key)));
+                                    return Ok((Some(Encrypt::new(key)), None));
                                 }
                                 Err(e) => {
-                                    log::error!("secure_tcp handshake failed: {}", e);
+                                    log::error!("secure_tcp handshake decode failed: {}", e);
                                     return Err(e);
                                 }
                             }
                         }
                     }
-                    // Not a KeyExchange - might be an old client, treat as first message
-                    log::warn!("TCP connection did not complete handshake, closing");
+                    // Not a KeyExchange response - client doesn't support secure_tcp
+                    // Fall back to no-encryption mode, return first message for processing
+                    log::info!(
+                        "TCP client does not support secure_tcp handshake, falling back to plain mode"
+                    );
+                    return Ok((None, Some(bytes)));
                 }
-                bail!("secure_tcp handshake failed: invalid response");
+                // Unparseable message - fall back to no-encryption mode
+                log::info!(
+                    "TCP client sent unparseable message, falling back to plain mode"
+                );
+                return Ok((None, Some(bytes)));
             }
             Ok(Some(Err(e))) => {
                 bail!("secure_tcp handshake failed: {}", e);
@@ -1497,21 +1512,33 @@ impl RendezvousServer {
         } else {
             let mut framed = Framed::new(stream, BytesCodec::new());
 
-            // Perform secure_tcp handshake for non-WS TCP connections
-            let (sink_encrypt, mut recv_encrypt) = match self.secure_tcp_handshake(&mut framed).await {
-                Ok(Some(encrypt)) => (Some(encrypt.clone()), Some(encrypt)),
-                Ok(None) => (None, None),
-                Err(e) => {
-                    log::debug!("TCP handshake failed for {:?}: {}", addr, e);
-                    return Err(e);
-                }
-            };
+            // Try secure_tcp handshake for non-WS TCP connections
+            // Falls back to no-encryption mode if client doesn't support it
+            let (sink_encrypt, mut recv_encrypt, first_msg) =
+                match self.secure_tcp_handshake(&mut framed).await {
+                    Ok((Some(encrypt), None)) => (Some(encrypt.clone()), Some(encrypt), None),
+                    Ok((None, first_msg)) => (None, None, first_msg),
+                    Ok((Some(_), Some(_))) => unreachable!(),
+                    Err(e) => {
+                        log::debug!("TCP handshake failed for {:?}: {}", addr, e);
+                        return Err(e);
+                    }
+                };
 
             let (a, mut b) = framed.split();
             sink = Some(Sink::TcpStream(TcpSink {
                 inner: a,
                 encrypt: sink_encrypt,
             }));
+
+            // Process first message from fallback mode (client sent non-KeyExchange response)
+            if let Some(bytes) = first_msg {
+                if !bytes.is_empty() {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                        return Ok(());
+                    }
+                }
+            }
 
             while let Ok(Some(Ok(bytes))) = timeout(REG_TIMEOUT as u64, b.next()).await {
                 // Decrypt if encryption is enabled
