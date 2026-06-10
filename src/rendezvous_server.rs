@@ -1421,7 +1421,7 @@ impl RendezvousServer {
         match result {
             Ok(Some(Ok(bytes))) => {
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-                    if let Some(rendezvous_message::Union::KeyExchange(ke)) = msg_in.union {
+                    if let Some(rendezvous_message::Union::KeyExchange(ref ke)) = msg_in.union {
                         if ke.keys.len() >= 2 {
                             // Client sends: keys[0] = client's temporary public key
                             //                keys[1] = encrypted symmetric key
@@ -1439,16 +1439,30 @@ impl RendezvousServer {
                             }
                         }
                     }
-                    // Not a KeyExchange response - client doesn't support secure_tcp
-                    // Fall back to no-encryption mode, return first message for processing
-                    log::info!(
-                        "TCP client does not support secure_tcp handshake, falling back to plain mode"
-                    );
+                    // Not a KeyExchange response - client didn't perform secure_tcp handshake.
+                    // Log level depends on whether the message type is expected to be plain:
+                    // - Always encrypted (RegisterPk, HealthCheck): warn, unexpected
+                    // - Conditionally encrypted (PunchHoleRequest, RequestRelay): debug, possible
+                    // - Never encrypted (PunchHoleSent, LocalAddr, RelayResponse, etc.): debug, expected
+                    match &msg_in.union {
+                        Some(rendezvous_message::Union::RegisterPk(_))
+                        | Some(rendezvous_message::Union::Hc(_)) => {
+                            log::warn!(
+                                "Received {:?} without secure_tcp handshake, this message type should always be encrypted",
+                                msg_in.union
+                            );
+                        }
+                        _ => {
+                            log::debug!(
+                                "Client sent non-KeyExchange message, falling back to plain mode"
+                            );
+                        }
+                    }
                     return Ok((None, Some(bytes)));
                 }
                 // Unparseable message - fall back to no-encryption mode
-                log::info!(
-                    "TCP client sent unparseable message, falling back to plain mode"
+                log::debug!(
+                    "TCP client sent unparseable message during handshake, falling back to plain mode"
                 );
                 return Ok((None, Some(bytes)));
             }
