@@ -56,12 +56,11 @@ jobs:
           profile: minimal
           target: ${{ matrix.job.target }}
 
+      - name: Install cross
+        run: cargo install cross --locked
+
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --all-features --target=${{ matrix.job.target }}
-          use-cross: true
+        run: cross build --release --all-features --target=${{ matrix.job.target }}
 
       - name: Exec chmod
         run: chmod -v a+x target/${{ matrix.job.target }}/release/*
@@ -96,11 +95,7 @@ jobs:
           target: x86_64-pc-windows-msvc
 
       - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --release --all-features --target=x86_64-pc-windows-msvc
-          use-cross: true
+        run: cargo build --release --all-features --target=x86_64-pc-windows-msvc
 
       - name: Install NSIS
         run: |
