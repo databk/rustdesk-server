@@ -556,7 +556,7 @@ jobs:
       - name: Create packaging env
         run: |
           sudo apt update
-          DEBIAN_FRONTEND=noninteractive sudo apt install -y devscripts build-essential debhelper pkg-config libssl-dev ${{ matrix.job.crossbuild_package }}
+          DEBIAN_FRONTEND=noninteractive sudo apt install -y devscripts build-essential debhelper pkg-config ${{ matrix.job.crossbuild_package }}
           mkdir -p debian-build/${{ matrix.job.name }}/bin
 
       - name: Download binaries
