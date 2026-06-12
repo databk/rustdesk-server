@@ -59,6 +59,11 @@ jobs:
       - name: Install cross
         run: cargo install cross --locked
 
+      - name: Install development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
       - name: Build
         run: cross build --release --all-features --target=${{ matrix.job.target }}
 
