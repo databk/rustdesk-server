@@ -63,6 +63,8 @@ jobs:
 
       - name: Build
         uses: actions-rs/cargo@v1
+        env:
+          PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
         with:
           command: build
           args: --release --all-features --target=${{ matrix.job.target }}
@@ -102,6 +104,8 @@ jobs:
 
       - name: Build
         uses: actions-rs/cargo@v1
+        env:
+          PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
         with:
           command: build
           args: --release --all-features --target=x86_64-pc-windows-msvc
@@ -137,6 +141,8 @@ jobs:
         working-directory: ./ui/html
 
       - name: Build UI setup file
+        env:
+          PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
         run: |
           rustup default nightly
           cargo build --release
