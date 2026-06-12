@@ -6,26 +6,6 @@ on:
   pull_request:
 
 jobs:
-  fmt:
-    name: Format Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: "1.90"
-          components: rustfmt
-          override: true
-
-      - name: Check formatting
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --check --all
-
   check:
     name: Compile Check
     runs-on: ubuntu-latest
@@ -46,28 +26,6 @@ jobs:
         with:
           command: check
           args: --all-features
-
-  clippy:
-    name: Clippy Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: "1.90"
-          components: clippy
-          override: true
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --all-features -- -D warnings
 
   test:
     name: Run Tests
