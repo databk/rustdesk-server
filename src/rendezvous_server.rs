@@ -434,6 +434,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        forwarded_ip: Option<&str>,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -532,7 +533,9 @@ impl RendezvousServer {
                         return false;
                     }
                     let id = rk.id.clone();
-                    let ip = addr.ip().to_string();
+                    let ip = forwarded_ip
+                        .map(|s| s.to_owned())
+                        .unwrap_or_else(|| addr.ip().to_string());
                     match self.validate_register_pk(&id, &rk.uuid, &rk.pk, &ip).await {
                         Ok((peer, changed, _ip_changed)) => {
                             // Always update for WS/TCP peers: socket_addr must reflect the
@@ -1496,29 +1499,63 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let mut forwarded_ip: Option<String> = None;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-            let callback = |req: &Request, response: Response| {
+            let forwarded_ip_cell: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+                Default::default();
+            let forwarded_ip_cb = forwarded_ip_cell.clone();
+            let callback = move |req: &Request, response: Response| {
                 let headers = req.headers();
                 let real_ip = headers
                     .get("X-Real-IP")
                     .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
+                    .and_then(|header_value| header_value.to_str().ok())
+                    // X-Forwarded-For can be a comma-separated chain; the
+                    // original client is always the first entry.
+                    .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+                    .filter(|s| !s.is_empty());
                 if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
+                    *forwarded_ip_cb.lock().unwrap() = Some(ip);
                 }
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            forwarded_ip = forwarded_ip_cell.lock().unwrap().clone();
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+            while let Ok(Some(res)) = timeout(30_000, b.next()).await {
+                match res {
+                    Ok(tungstenite::Message::Binary(bytes)) => {
+                        // Handle heartbeat (empty message), mirroring the plain-TCP
+                        // branch below. Without this, a client's periodic empty
+                        // keep-alive is treated as "unhandled" by handle_tcp(),
+                        // which returns false and closes the WS connection.
+                        if bytes.is_empty() {
+                            if let Some(s) = sink.as_mut() {
+                                Self::send_to_sink(s, RendezvousMessage::new()).await;
+                            }
+                            continue;
+                        }
+                        if !self
+                            .handle_tcp(&bytes, &mut sink, addr, key, ws, forwarded_ip.as_deref())
+                            .await
+                        {
+                            break;
+                        }
+                    }
+                    Ok(tungstenite::Message::Close(_)) => {
+                        // Explicit close frame: stop immediately instead of waiting
+                        // for the 30s idle timeout to expire.
+                        break;
+                    }
+                    Ok(_) => {
+                        // Ping/Pong/Text/Frame: not part of the protocol, ignore
+                        // but keep the connection alive (already resets the
+                        // 30s timeout since we got here).
+                    }
+                    Err(err) => {
+                        log::debug!("WS read error from {:?}: {}", addr, err);
                         break;
                     }
                 }
@@ -1548,7 +1585,7 @@ impl RendezvousServer {
             // Process first message from fallback mode (client sent non-KeyExchange response)
             if let Some(bytes) = first_msg {
                 if !bytes.is_empty() {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, None).await {
                         return Ok(());
                     }
                 }
@@ -1576,7 +1613,7 @@ impl RendezvousServer {
                     continue;
                 }
 
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, None).await {
                     break;
                 }
             }
