@@ -13,7 +13,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::{
-        register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
+        register_pk_response::Result::{ID_EXISTS, INVALID_ID_FORMAT, TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
     tcp::{listen_any, Encrypt, FramedStream},
@@ -349,11 +349,22 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
+                    if rk.uuid.is_empty() {
                         return Ok(());
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
+                    if rk.pk.is_empty() {
+                        // change-id pre-check: validate availability without persisting
+                        let result = self.validate_change_id(&id, &rk.uuid, &ip).await;
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_pk_response(RegisterPkResponse {
+                            result: result.into(),
+                            ..Default::default()
+                        });
+                        socket.send(&msg_out, addr).await?;
+                        return Ok(());
+                    }
                     match self.validate_register_pk(&id, &rk.uuid, &rk.pk, &ip).await {
                         Ok((peer, changed, _ip_changed)) => {
                             if changed {
@@ -529,13 +540,22 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if rk.uuid.is_empty() || rk.pk.is_empty() {
+                    if rk.uuid.is_empty() {
                         return false;
                     }
                     let id = rk.id.clone();
                     let ip = forwarded_ip
                         .map(|s| s.to_owned())
                         .unwrap_or_else(|| addr.ip().to_string());
+                    if rk.pk.is_empty() {
+                        // change-id pre-check: validate availability without persisting
+                        let result = self.validate_change_id(&id, &rk.uuid, &ip).await;
+                        let msg_out = Self::make_register_pk_response(result);
+                        if let Some(s) = sink.as_mut() {
+                            Self::send_to_sink(s, msg_out).await;
+                        }
+                        return false;
+                    }
                     match self.validate_register_pk(&id, &rk.uuid, &rk.pk, &ip).await {
                         Ok((peer, changed, _ip_changed)) => {
                             // Always update for WS/TCP peers: socket_addr must reflect the
@@ -1062,6 +1082,33 @@ impl RendezvousServer {
             ..Default::default()
         });
         msg_out
+    }
+
+    /// Validates a change-id pre-check request (RegisterPk with empty pk).
+    ///
+    /// The client sends this before persisting a new id locally to verify the
+    /// new id is available on every rendezvous server. No state is persisted;
+    /// this only checks availability and returns the appropriate
+    /// `RegisterPkResponse::Result`.
+    async fn validate_change_id(
+        &self,
+        id: &str,
+        uuid: &[u8],
+        ip: &str,
+    ) -> register_pk_response::Result {
+        if !hbb_common::is_valid_custom_id(id) {
+            return INVALID_ID_FORMAT;
+        }
+        if !self.check_ip_blocker(ip, id).await {
+            return TOO_FREQUENT;
+        }
+        if let Some(peer) = self.pm.get(id).await {
+            let peer = peer.read().await;
+            if !peer.uuid.is_empty() && peer.uuid.as_ref() != uuid {
+                return ID_EXISTS;
+            }
+        }
+        register_pk_response::Result::OK
     }
 
     /// Validates a RegisterPk request. Returns Ok((peer, changed, ip_changed)) on success,
