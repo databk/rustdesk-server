@@ -65,6 +65,7 @@ reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocki
 
 [build-dependencies]
 hbb_common = { path = "libs/hbb_common" }
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [workspace]
 members = ["libs/hbb_common"]
