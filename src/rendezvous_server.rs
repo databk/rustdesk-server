@@ -411,23 +411,8 @@ impl RendezvousServer {
                         }
                     }
                 }
-                Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    if self.pm.is_in_memory(&ph.id).await {
-                        self.handle_udp_punch_hole_request(addr, ph, key).await?;
-                    } else {
-                        // not in memory, fetch from db with spawn in case blocking me
-                        let mut me = self.clone();
-                        let key = key.to_owned();
-                        tokio::spawn(async move {
-                            allow_err!(me.handle_udp_punch_hole_request(addr, ph, &key).await);
-                        });
-                    }
-                }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     self.handle_hole_sent(phs, addr, Some(socket)).await?;
-                }
-                Some(rendezvous_message::Union::LocalAddr(la)) => {
-                    self.handle_local_addr(la, addr, Some(socket)).await?;
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -1066,40 +1051,6 @@ impl RendezvousServer {
             }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    async fn handle_udp_punch_hole_request(
-        &mut self,
-        addr: SocketAddr,
-        ph: PunchHoleRequest,
-        key: &str,
-    ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        match to_addr {
-            Some(to_addr) => {
-                // Check if target is a WS/TCP peer with persistent connection
-                let addr_v4 = try_into_v4(to_addr);
-                let sink_arc = self.ws_map.lock().await.get(&addr_v4).cloned();
-                if let Some(sink_arc) = sink_arc {
-                    let mut ws_sink = sink_arc.lock().await;
-                    Self::send_to_sink(&mut *ws_sink, msg).await;
-                } else {
-                    let sink_arc = self.tcp_map.lock().await.get(&addr_v4).cloned();
-                    if let Some(sink_arc) = sink_arc {
-                        let mut tcp_sink = sink_arc.lock().await;
-                        Self::send_to_sink(&mut *tcp_sink, msg).await;
-                    } else {
-                        self.tx.send(Data::Msg(msg.into(), to_addr))?;
-                    }
-                }
-            }
-            None => {
-                // Error response goes back to the UDP requester
-                self.tx.send(Data::Msg(msg.into(), addr))?;
-            }
         }
         Ok(())
     }
