@@ -411,16 +411,8 @@ impl RendezvousServer {
                         }
                     }
                 }
-                Some(rendezvous_message::Union::PunchHoleRequest(_ph)) => {
-                    // UDP PunchHoleRequest is intentionally unsupported.
-                    // The client sends PunchHoleRequest over TCP/WS, not UDP.
-                }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     self.handle_hole_sent(phs, addr, Some(socket)).await?;
-                }
-                Some(rendezvous_message::Union::LocalAddr(_la)) => {
-                    // UDP LocalAddr is intentionally unsupported.
-                    // The client sends LocalAddr over TCP, not UDP.
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -1062,7 +1054,6 @@ impl RendezvousServer {
         }
         Ok(())
     }
-
 
     fn make_register_pk_response(result: register_pk_response::Result) -> RendezvousMessage {
         let mut msg_out = RendezvousMessage::new();
