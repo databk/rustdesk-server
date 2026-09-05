@@ -675,7 +675,7 @@ impl RendezvousServer {
                     let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
                     for (i, peer_id) in peers.iter().enumerate() {
                         if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                            let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                            let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
                             let states_idx = i / 8;
                             let bit_idx = 7 - i % 8;
                             if elapsed < REG_TIMEOUT {
