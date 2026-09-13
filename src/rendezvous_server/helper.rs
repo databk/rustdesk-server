@@ -34,7 +34,7 @@ impl RendezvousServer {
                 Some(peer) => {
                     let pk = peer.read().await.pk.clone();
                     sign::sign(
-                        &hbb_common::message_proto::IdPk {
+                        &hbb_common::rendezvous_proto::IdPk {
                             id,
                             pk,
                             ..Default::default()
