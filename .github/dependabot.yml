@@ -9,3 +9,12 @@ updates:
       prefix: "Git submodule"
     labels:
       - "dependencies"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "master"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "GitHub Actions"
+    labels:
+      - "dependencies"
