@@ -11,6 +11,7 @@ use hbb_common::{
         stream::StreamExt,
     },
     log,
+    protobuf::Message as _,
     rendezvous_proto::*,
     tcp::{Encrypt, FramedStream},
     timeout,

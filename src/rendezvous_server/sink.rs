@@ -4,6 +4,8 @@ use hbb_common::{
     allow_err,
     bytes::Bytes,
     futures_util::sink::SinkExt,
+    log,
+    protobuf::Message as _,
     rendezvous_proto::*,
     try_into_v4,
     ResultType,

@@ -5,7 +5,7 @@ use hbb_common::{
     allow_err,
     bytes::BytesMut,
     log,
-    protobuf::MessageField,
+    protobuf::{Message as _, MessageField},
     rendezvous_proto::*,
     try_into_v4,
     AddrMangle,
