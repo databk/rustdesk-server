@@ -3,6 +3,7 @@ use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
     log,
+    protobuf::Message as _,
     rendezvous_proto::*,
     try_into_v4,
     udp::FramedSocket,

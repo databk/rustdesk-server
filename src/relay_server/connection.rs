@@ -4,6 +4,7 @@ use hbb_common::{
     allow_err, bail,
     bytes::Bytes,
     log,
+    protobuf::Message as _,
     rendezvous_proto::*,
     sleep,
     tcp::FramedStream,

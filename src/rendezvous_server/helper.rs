@@ -7,6 +7,7 @@ use hbb_common::{
     config,
     futures_util::stream::StreamExt,
     log,
+    protobuf::Message as _,
     rendezvous_proto::*,
     tcp::FramedStream,
     timeout,
