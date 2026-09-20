@@ -268,7 +268,7 @@ jobs:
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: "./docker"
           platforms: ${{ matrix.job.docker_platform }}
@@ -429,7 +429,7 @@ jobs:
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: "./docker-classic"
           platforms: ${{ matrix.job.docker_platform }}
