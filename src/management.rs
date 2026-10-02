@@ -208,11 +208,12 @@ struct ApiState {
     values: BTreeMap<String, String>,
 }
 
-async fn authorize(
-    Extension(state): Extension<ApiState>,
-    request: Request<Body>,
-    next: Next<Body>,
-) -> Response {
+async fn authorize(request: Request<Body>, next: Next<Body>) -> Response {
+    // Axum 0.5 from_fn middleware takes only Request and Next.
+    let state = match request.extensions().get::<ApiState>() {
+        Some(state) => state,
+        None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     let expected = format!("Bearer {}", state.token);
     let actual = request
         .headers()
