@@ -8,6 +8,7 @@ use hbbs::{common::*, *};
 const RMEM: usize = 0;
 
 fn main() -> ResultType<()> {
+    management::restore_bans("hbbs")?;
     let managed = management::load_config("hbbs")?;
     managed.apply();
     let _logger = Logger::try_with_env_or_str("info")?

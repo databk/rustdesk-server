@@ -8,6 +8,7 @@ use relay_server::*;
 mod version;
 
 fn main() -> ResultType<()> {
+    management::restore_bans("hbbr")?;
     let managed = management::load_config("hbbr")?;
     managed.apply();
     let _logger = Logger::try_with_env_or_str("info")?

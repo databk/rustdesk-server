@@ -19,12 +19,13 @@ use std::{
     sync::RwLock,
     time::Instant,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex};
 
 pub const REDACTED: &str = "__REDACTED__";
 static PEERS: Lazy<RwLock<Vec<Value>>> = Lazy::new(|| RwLock::new(Vec::new()));
 static SESSIONS: Lazy<RwLock<HashMap<String, Session>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static BANS: Lazy<RwLock<Bans>> = Lazy::new(|| RwLock::new(Bans::default()));
+static BAN_UPDATES: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -294,17 +295,31 @@ async fn replace_bans(
         )
             .into_response();
     }
-    let mut current = BANS.write().unwrap();
-    if *current == bans {
-        return Json(json!({"state":"applied"})).into_response();
+    // The task owns the update through persistence and activation even if the
+    // HTTP caller disconnects while the blocking filesystem work is in flight.
+    match tokio::spawn(async move {
+        let _update = BAN_UPDATES.lock().await;
+        if *BANS.read().unwrap() == bans {
+            return Ok(());
+        }
+        let service = state.service;
+        let persisted = bans.clone();
+        tokio::task::spawn_blocking(move || persist_bans(service, &persisted)).await??;
+        // Never hold the protocol admission lock during filesystem I/O.
+        // Keep the BANS -> SESSIONS order for activation and admission.
+        let mut current = BANS.write().unwrap();
+        *current = bans;
+        cancel_banned_sessions(&current);
+        Ok::<(), hbb_common::anyhow::Error>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => Json(json!({"state":"applied"})).into_response(),
+        result => {
+            log::error!("Unable to persist management bans: {result:?}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-    if let Err(err) = persist_bans(state.service, &bans) {
-        log::error!("Unable to persist management bans: {err}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    *current = bans;
-    cancel_banned_sessions(&current);
-    Json(json!({"state":"applied"})).into_response()
 }
 
 fn cancel_banned_sessions(bans: &Bans) {
@@ -329,6 +344,20 @@ fn persist_bans(service: &str, bans: &Bans) -> ResultType<()> {
     Ok(())
 }
 
+// Persisted admission policy is independent of management HTTP exposure.
+pub fn restore_bans(service: &str) -> ResultType<()> {
+    match std::fs::read(data_path(service, "bans")) {
+        Ok(bytes) => {
+            let mut bans: Bans = serde_json::from_slice(&bytes)?;
+            bans.validate()?;
+            *BANS.write().unwrap() = bans;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok(())
+}
+
 pub fn start(service: &'static str, port: u16) -> ResultType<()> {
     let bind = std::env::var("RD_MANAGEMENT_BIND").unwrap_or_default();
     if bind.is_empty() {
@@ -339,15 +368,6 @@ pub fn start(service: &'static str, port: u16) -> ResultType<()> {
         return Err(anyhow!(
             "RD_MANAGEMENT_TOKEN must contain at least 32 characters"
         ));
-    }
-    match std::fs::read(data_path(service, "bans")) {
-        Ok(bytes) => {
-            let mut bans: Bans = serde_json::from_slice(&bytes)?;
-            bans.validate()?;
-            *BANS.write().unwrap() = bans;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
     }
     let mut values = BTreeMap::new();
     for definition in schema(service) {
@@ -402,6 +422,117 @@ fn router(state: ApiState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static POLICY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct PolicyFixture {
+        directory: PathBuf,
+        previous_directory: Option<String>,
+        previous_bind: Option<String>,
+        previous_bans: Bans,
+    }
+    impl PolicyFixture {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "rustdesk-policy-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let fixture = Self {
+                directory,
+                previous_directory: std::env::var("RD_MANAGEMENT_DIR").ok(),
+                previous_bind: std::env::var("RD_MANAGEMENT_BIND").ok(),
+                previous_bans: BANS.read().unwrap().clone(),
+            };
+            std::env::set_var("RD_MANAGEMENT_DIR", &fixture.directory);
+            std::env::remove_var("RD_MANAGEMENT_BIND");
+            *BANS.write().unwrap() = Bans::default();
+            fixture
+        }
+    }
+    impl Drop for PolicyFixture {
+        fn drop(&mut self) {
+            *BANS.write().unwrap() = self.previous_bans.clone();
+            for (name, previous) in [
+                ("RD_MANAGEMENT_DIR", &self.previous_directory),
+                ("RD_MANAGEMENT_BIND", &self.previous_bind),
+            ] {
+                if let Some(value) = previous {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_policy_updates_persist_the_active_policy_and_write_failures_do_not_activate(
+    ) {
+        let _test = POLICY_TEST.lock().unwrap();
+        let fixture = PolicyFixture::new();
+        let state = ApiState {
+            service: "hbbs",
+            token: "test".into(),
+            started: Instant::now(),
+            values: BTreeMap::new(),
+        };
+        let a = Bans {
+            device_ids: vec!["policy-a".into()],
+            ips: vec![],
+        };
+        let b = Bans {
+            device_ids: vec!["policy-b".into()],
+            ips: vec![],
+        };
+        let (a_result, b_result) = tokio::join!(
+            replace_bans(Extension(state.clone()), Json(a)),
+            replace_bans(Extension(state.clone()), Json(b)),
+        );
+        assert_eq!(a_result.status(), StatusCode::OK);
+        assert_eq!(b_result.status(), StatusCode::OK);
+        let persisted: Bans =
+            serde_json::from_slice(&std::fs::read(data_path("hbbs", "bans")).unwrap()).unwrap();
+        assert!(*BANS.read().unwrap() == persisted);
+        // Force the next rename to fail; the active policy must remain intact.
+        std::fs::remove_file(data_path("hbbs", "bans")).unwrap();
+        std::fs::create_dir(data_path("hbbs", "bans")).unwrap();
+        let result = replace_bans(
+            Extension(state),
+            Json(Bans {
+                device_ids: vec!["policy-c".into()],
+                ips: vec![],
+            }),
+        )
+        .await;
+        assert_eq!(result.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(*BANS.read().unwrap() == persisted);
+        drop(fixture);
+    }
+
+    #[test]
+    fn saved_policy_is_restored_when_management_listener_is_disabled() {
+        let _test = POLICY_TEST.lock().unwrap();
+        let _fixture = PolicyFixture::new();
+        persist_bans(
+            "hbbs",
+            &Bans {
+                device_ids: vec!["blocked-device".into()],
+                ips: vec!["192.0.2.25".into()],
+            },
+        )
+        .unwrap();
+        restore_bans("hbbs").unwrap();
+        start("hbbs", 21116).unwrap();
+        assert!(is_banned("blocked-device", ""));
+        assert!(is_banned("", "192.0.2.25"));
+        std::fs::write(data_path("hbbs", "bans"), b"invalid policy").unwrap();
+        assert!(restore_bans("hbbs").is_err());
+    }
     #[tokio::test]
     async fn http_routes_require_authorization_and_do_not_leak_tokens() {
         use tokio::{
@@ -448,6 +579,7 @@ mod tests {
     }
     #[test]
     fn bans_cancel_existing_sessions_and_duplicates_are_rejected() {
+        let _test = POLICY_TEST.lock().unwrap();
         let mut rx = open_session(
             "test-session",
             vec!["123456".into()],
