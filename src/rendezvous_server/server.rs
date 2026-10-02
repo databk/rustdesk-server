@@ -2,8 +2,7 @@ use super::*;
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
-    allow_err,
-    config,
+    allow_err, config,
     futures_util::stream::StreamExt,
     log,
     rendezvous_proto::*,
@@ -77,6 +76,19 @@ impl RendezvousServer {
             ws_map: Arc::new(hbb_common::tokio::sync::Mutex::new(HashMap::new())),
             tcp_map: Arc::new(hbb_common::tokio::sync::Mutex::new(HashMap::new())),
         };
+        if std::env::var("RD_MANAGEMENT_BIND")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            let peers = rs.pm.clone();
+            tokio::spawn(async move {
+                let mut timer = interval(Duration::from_secs(2));
+                loop {
+                    timer.tick().await;
+                    crate::management::set_peers(peers.management_snapshot().await);
+                }
+            });
+        }
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
@@ -85,6 +97,7 @@ impl RendezvousServer {
         let mut listener2 = helper::create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = helper::create_tcp_listener(bind_addr, ws_port).await?;
         let mut listener_console = listen_console(bind_addr, nat_port as _).await?;
+        crate::management::start("hbbs", port as u16)?;
         log::info!("Listening on tcp/udp {}", listener.local_addr()?);
         log::info!(
             "Listening on tcp {}, extra port for NAT test",

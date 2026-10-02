@@ -1,20 +1,9 @@
 use super::*;
-use hbb_common::{
-    log,
-    tokio,
-    ResultType,
-};
-use std::{
-    io::prelude::*,
-    net::IpAddr,
-};
+use hbb_common::{log, tokio, ResultType};
+use std::{io::prelude::*, net::IpAddr};
 
 #[tokio::main(flavor = "multi_thread")]
-pub async fn start_with_bind(
-    bind_addr: Option<IpAddr>,
-    port: &str,
-    key: &str,
-) -> ResultType<()> {
+pub async fn start_with_bind(bind_addr: Option<IpAddr>, port: &str, key: &str) -> ResultType<()> {
     let key = helper::get_server_sk(key);
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
@@ -47,19 +36,24 @@ pub async fn start_with_bind(
         BLOCKLIST.read().await.len()
     );
     let port: u16 = port.parse()?;
+    if port == 0 || port > 65533 {
+        return Err(hbb_common::anyhow::anyhow!("Invalid relay port"));
+    }
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
     let main_task = async move {
+        let mut management_started = false;
         loop {
             log::info!("Start");
-            connection::io_loop(
-                crate::common::listen_tcp(bind_addr, port).await?,
-                crate::common::listen_tcp(bind_addr, port2).await?,
-                crate::common::listen_console(bind_addr, port).await?,
-                &key,
-            )
-            .await;
+            let listener = crate::common::listen_tcp(bind_addr, port).await?;
+            let websocket = crate::common::listen_tcp(bind_addr, port2).await?;
+            let console = crate::common::listen_console(bind_addr, port).await?;
+            if !management_started {
+                crate::management::start("hbbr", port)?;
+                management_started = true;
+            }
+            connection::io_loop(listener, websocket, console, &key).await;
         }
     };
     let listen_signal = crate::common::listen_signal();

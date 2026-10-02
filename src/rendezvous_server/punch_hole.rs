@@ -1,16 +1,11 @@
 use super::*;
 use crate::common::*;
 use crate::peer::*;
+use hbb_common::bytes::BytesMut;
 use hbb_common::{
-    log,
-    rendezvous_proto::*,
-    tcp::FramedStream,
-    try_into_v4,
-    udp::FramedSocket,
-    AddrMangle,
+    log, rendezvous_proto::*, tcp::FramedStream, try_into_v4, udp::FramedSocket, AddrMangle,
     ResultType,
 };
-use hbb_common::bytes::BytesMut;
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -93,7 +88,11 @@ impl RendezvousServer {
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
-            log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+            log::warn!(
+                "Authentication failed from {} for peer {} - invalid key",
+                addr,
+                ph.id
+            );
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -108,6 +107,14 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
+            if crate::management::is_banned(&id, &peer.read().await.info.ip) {
+                let mut response = RendezvousMessage::new();
+                response.set_punch_hole_response(PunchHoleResponse {
+                    other_failure: "Blocked by server policy".to_owned(),
+                    ..Default::default()
+                });
+                return Ok((response, None));
+            }
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
@@ -151,7 +158,8 @@ impl RendezvousServer {
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
             let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-            if ALWAYS_USE_RELAY.load(std::sync::atomic::Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
+            if ALWAYS_USE_RELAY.load(std::sync::atomic::Ordering::SeqCst) || (peer_is_lan ^ is_lan)
+            {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
@@ -215,7 +223,11 @@ impl RendezvousServer {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
+                let peer = peer.read().await;
+                if crate::management::is_banned(peer_id, &peer.info.ip) {
+                    continue;
+                }
+                let elapsed = peer.last_reg_time.elapsed().as_millis() as i64;
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;

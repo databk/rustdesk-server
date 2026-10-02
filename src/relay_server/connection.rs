@@ -17,10 +17,7 @@ use hbb_common::{
     },
     ResultType,
 };
-use std::{
-    net::SocketAddr,
-    sync::atomic::Ordering,
-};
+use std::{net::SocketAddr, sync::atomic::Ordering};
 
 pub(crate) async fn io_loop(
     listener: TcpListener,
@@ -95,6 +92,9 @@ async fn handle_connection(
         return;
     }
     let ip = ip.to_string();
+    if crate::management::is_banned("", &ip) {
+        return;
+    }
     if BLOCKLIST.read().await.get(&ip).is_some() {
         log::info!("{} blocked", ip);
         return;
@@ -113,6 +113,7 @@ async fn make_pair(
     limiter: Limiter,
     ws: bool,
 ) -> ResultType<()> {
+    let socket_ip = addr.ip().to_string();
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
@@ -140,9 +141,16 @@ async fn make_pair(
             Ok(response)
         };
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, key, limiter, socket_ip).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        make_pair_(
+            FramedStream::from(stream, addr),
+            addr,
+            key,
+            limiter,
+            socket_ip,
+        )
+        .await;
     }
     Ok(())
 }
@@ -152,6 +160,7 @@ async fn make_pair_(
     addr: SocketAddr,
     key: &str,
     limiter: Limiter,
+    socket_ip: String,
 ) {
     let mut stream = stream;
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
@@ -161,30 +170,70 @@ async fn make_pair_(
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
                 }
-                if !rf.uuid.is_empty() {
-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
-                    if let Some(peer) = peer.as_mut() {
-                        log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
-                        let id = format!("{}:{}", addr.ip(), addr.port());
-                        USAGE.write().await.insert(id.clone(), Default::default());
-                        if !stream.is_ws() && !peer.is_ws() {
-                            peer.set_raw();
-                            stream.set_raw();
-                            log::info!("Both are raw");
+                if !rf.uuid.is_empty()
+                    && rf.uuid.len() <= 128
+                    && !crate::management::is_banned(&rf.id, &addr.ip().to_string())
+                {
+                    let mut peers = PEERS.lock().await;
+                    let mut pending = match peers.remove(&rf.uuid) {
+                        Some(pending) => pending,
+                        None => {
+                            let generation = uuid::Uuid::new_v4().to_string();
+                            peers.insert(
+                                rf.uuid.clone(),
+                                PendingPeer {
+                                    stream: Box::new(stream),
+                                    address: addr,
+                                    target_id: rf.id,
+                                    socket_ip,
+                                    generation: generation.clone(),
+                                },
+                            );
+                            drop(peers);
+                            sleep(30.).await;
+                            let mut peers = PEERS.lock().await;
+                            if peers.get(&rf.uuid).map(|p| &p.generation) == Some(&generation) {
+                                peers.remove(&rf.uuid);
+                            }
+                            return;
                         }
-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
-                        {
-                            log::info!("Relay of {} closed: {}", addr, err);
-                        } else {
-                            log::info!("Relay of {} closed", addr);
-                        }
-                        USAGE.write().await.remove(&id);
-                    } else {
-                        log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
-                        sleep(30.).await;
-                        PEERS.lock().await.remove(&rf.uuid);
+                    };
+                    drop(peers);
+                    let peer = &mut pending.stream;
+                    let info = serde_json::json!({"uuid":rf.uuid,"target_id":rf.id,
+                        "peer_target_id":pending.target_id,"endpoints":[pending.address.to_string(),addr.to_string()],
+                        "transport":if stream.is_ws() || peer.is_ws() {"websocket"} else {"tcp"},
+                        "started_at":crate::common::now(),"bytes":0,"bytes_per_second":0,"closing":false});
+                    let cancel = crate::management::open_session(
+                        &rf.uuid,
+                        vec![rf.id.clone(), pending.target_id.clone()],
+                        vec![
+                            addr.ip().to_string(),
+                            pending.address.ip().to_string(),
+                            socket_ip,
+                            pending.socket_ip.clone(),
+                        ],
+                        info,
+                    );
+                    let mut cancel = match cancel {
+                        Some(cancel) => cancel,
+                        None => return,
+                    };
+                    let id = format!("{}:{}", addr.ip(), addr.port());
+                    USAGE.write().await.insert(id.clone(), Default::default());
+                    if !stream.is_ws() && !peer.is_ws() {
+                        peer.set_raw();
+                        stream.set_raw();
                     }
+                    let result = tokio::select! {
+                        result = relay(addr, &mut stream, peer, limiter, id.clone(), &rf.uuid, pending.address) => result,
+                        _ = &mut cancel => Ok(()),
+                    };
+                    if let Err(err) = result {
+                        log::info!("Relay {} closed: {}", rf.uuid, err);
+                    }
+                    crate::management::close_session(&rf.uuid);
+                    USAGE.write().await.remove(&id);
                 }
             }
         }
@@ -197,8 +246,11 @@ async fn relay(
     peer: &mut Box<dyn super::stream::StreamTrait>,
     total_limiter: Limiter,
     id: String,
+    session_uuid: &str,
+    peer_address: SocketAddr,
 ) -> ResultType<()> {
     let ip = addr.ip().to_string();
+    let peer_ip = peer_address.ip().to_string();
     let mut tm = std::time::Instant::now();
     let mut elapsed = 0;
     let mut total = 0;
@@ -262,13 +314,16 @@ async fn relay(
 
         let n = tm.elapsed().as_millis() as usize;
         if n >= 1_000 {
-            if BLOCKLIST.read().await.get(&ip).is_some() {
+            if BLOCKLIST.read().await.get(&ip).is_some()
+                || BLOCKLIST.read().await.get(&peer_ip).is_some()
+            {
                 log::info!("{} blocked", ip);
                 break;
             }
             blacked = BLACKLIST.read().await.get(&ip).is_some();
             tm = std::time::Instant::now();
             let speed = total_s / n;
+            crate::management::update_session(session_uuid, total / 8, total_s * 1000 / n / 8);
             if speed > highest_s {
                 highest_s = speed;
             }
