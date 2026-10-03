@@ -2,14 +2,10 @@ use super::*;
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
-    allow_err,
-    bail,
+    allow_err, bail,
     bytes::Bytes,
     bytes_codec::BytesCodec,
-    futures_util::{
-        sink::SinkExt,
-        stream::StreamExt,
-    },
+    futures_util::{sink::SinkExt, stream::StreamExt},
     log,
     protobuf::Message as _,
     rendezvous_proto::*,
@@ -22,8 +18,7 @@ use hbb_common::{
         sync::Mutex,
     },
     tokio_util::codec::Framed,
-    try_into_v4,
-    ResultType,
+    try_into_v4, ResultType,
 };
 use sodiumoxide::crypto::{box_, sign};
 use std::net::SocketAddr;
@@ -44,6 +39,9 @@ impl RendezvousServer {
                     }
                 }
             });
+            return;
+        }
+        if crate::management::is_banned("", &ip.to_string()) {
             return;
         }
         let stream = hbb_common::tcp::FramedStream::from(stream, addr);
@@ -110,7 +108,11 @@ impl RendezvousServer {
                             //                keys[1] = encrypted symmetric key
                             let client_box_pk_bytes = &ke.keys[0];
                             let symmetric_data = &ke.keys[1];
-                            match Encrypt::decode(symmetric_data, client_box_pk_bytes, &server_box_sk) {
+                            match Encrypt::decode(
+                                symmetric_data,
+                                client_box_pk_bytes,
+                                &server_box_sk,
+                            ) {
                                 Ok(key) => {
                                     log::debug!("secure_tcp handshake completed");
                                     return Ok((Some(Encrypt::new(key)), None));
@@ -208,7 +210,11 @@ impl RendezvousServer {
                     .and_then(|header_value| header_value.to_str().ok())
                     // X-Forwarded-For can be a comma-separated chain; the
                     // original client is always the first entry.
-                    .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+                    .map(|s| {
+                        crate::management::normalize_client_ip(
+                            s.split(',').next().unwrap_or(s).trim(),
+                        )
+                    })
                     .filter(|s| !s.is_empty());
                 if let Some(ip) = real_ip {
                     *forwarded_ip_cb.lock().unwrap() = Some(ip);
@@ -280,7 +286,10 @@ impl RendezvousServer {
             // Process first message from fallback mode (client sent non-KeyExchange response)
             if let Some(bytes) = first_msg {
                 if !bytes.is_empty() {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, None).await {
+                    if !self
+                        .handle_tcp(&bytes, &mut sink, addr, key, ws, None)
+                        .await
+                    {
                         return Ok(());
                     }
                 }
@@ -308,7 +317,10 @@ impl RendezvousServer {
                     continue;
                 }
 
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, None).await {
+                if !self
+                    .handle_tcp(&bytes, &mut sink, addr, key, ws, None)
+                    .await
+                {
                     break;
                 }
             }

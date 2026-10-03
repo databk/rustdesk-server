@@ -1,15 +1,10 @@
 use super::*;
 use crate::common::*;
 use crate::peer::*;
-use hbb_common::{
-    log,
-    protobuf::Message as _,
-    rendezvous_proto::*,
-    try_into_v4,
-    udp::FramedSocket,
-    ResultType,
-};
 use hbb_common::bytes::BytesMut;
+use hbb_common::{
+    log, protobuf::Message as _, rendezvous_proto::*, try_into_v4, udp::FramedSocket, ResultType,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,7 +18,23 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
+        if crate::management::is_banned("", &try_into_v4(addr).ip().to_string()) {
+            return Ok(());
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+            let target_id = match msg_in.union.as_ref() {
+                Some(rendezvous_message::Union::RegisterPeer(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::RegisterPk(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::PunchHoleRequest(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::RequestRelay(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::PunchHoleSent(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::LocalAddr(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::RelayResponse(v)) => v.id(),
+                _ => "",
+            };
+            if crate::management::is_banned(target_id, "") {
+                return Ok(());
+            }
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
@@ -70,9 +81,7 @@ impl RendezvousServer {
                             });
                             socket.send(&msg_out, addr).await?
                         }
-                        Err(msg_out) => {
-                            socket.send(&msg_out, addr).await?
-                        }
+                        Err(msg_out) => socket.send(&msg_out, addr).await?,
                     }
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {

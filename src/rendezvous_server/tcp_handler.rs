@@ -1,17 +1,15 @@
 use super::*;
 use crate::common::*;
 use crate::peer::*;
+use hbb_common::tokio::sync::Mutex;
 use hbb_common::{
     allow_err,
     bytes::BytesMut,
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::*,
-    try_into_v4,
-    AddrMangle,
-    ResultType,
+    try_into_v4, AddrMangle, ResultType,
 };
-use hbb_common::tokio::sync::Mutex;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,7 +25,27 @@ impl RendezvousServer {
         ws: bool,
         forwarded_ip: Option<&str>,
     ) -> bool {
+        if crate::management::is_banned("", &try_into_v4(addr).ip().to_string())
+            || forwarded_ip
+                .map(|ip| crate::management::is_banned("", ip))
+                .unwrap_or(false)
+        {
+            return false;
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+            let target_id = match msg_in.union.as_ref() {
+                Some(rendezvous_message::Union::RegisterPeer(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::RegisterPk(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::PunchHoleRequest(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::RequestRelay(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::PunchHoleSent(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::LocalAddr(v)) => v.id.as_str(),
+                Some(rendezvous_message::Union::RelayResponse(v)) => v.id(),
+                _ => "",
+            };
+            if crate::management::is_banned(target_id, "") {
+                return false;
+            }
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
@@ -43,6 +61,9 @@ impl RendezvousServer {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                        if crate::management::is_banned(&rf.id, &peer.read().await.info.ip) {
+                            return false;
+                        }
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
@@ -141,7 +162,9 @@ impl RendezvousServer {
                             // Always update for WS/TCP peers: socket_addr must reflect the
                             // current connection address even when key/uuid unchanged
                             if changed || ws {
-                                self.pm.update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip).await;
+                                self.pm
+                                    .update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip)
+                                    .await;
                             }
                             // Ensure socket_addr and last_reg_time are always up-to-date
                             if let Some(p) = self.pm.get_in_memory(&id).await {
@@ -149,20 +172,31 @@ impl RendezvousServer {
                                 p.socket_addr = addr;
                                 p.last_reg_time = Instant::now();
                             }
-                            let msg_out = Self::make_register_pk_response(register_pk_response::Result::OK);
-                            if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
+                            let msg_out =
+                                Self::make_register_pk_response(register_pk_response::Result::OK);
+                            if let Some(s) = sink.as_mut() {
+                                Self::send_to_sink(s, msg_out).await;
+                            }
                             // Store sink in persistent map for later message delivery
                             if let Some(s) = sink.take() {
                                 if ws {
-                                    self.ws_map.lock().await.insert(try_into_v4(addr), Arc::new(Mutex::new(s)));
+                                    self.ws_map
+                                        .lock()
+                                        .await
+                                        .insert(try_into_v4(addr), Arc::new(Mutex::new(s)));
                                 } else {
-                                    self.tcp_map.lock().await.insert(try_into_v4(addr), Arc::new(Mutex::new(s)));
+                                    self.tcp_map
+                                        .lock()
+                                        .await
+                                        .insert(try_into_v4(addr), Arc::new(Mutex::new(s)));
                                 }
                             }
                             return true;
                         }
                         Err(msg_out) => {
-                            if let Some(s) = sink.as_mut() { Self::send_to_sink(s, msg_out).await; }
+                            if let Some(s) = sink.as_mut() {
+                                Self::send_to_sink(s, msg_out).await;
+                            }
                             return false;
                         }
                     }
@@ -226,7 +260,8 @@ impl RendezvousServer {
                     let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
                     for (i, peer_id) in peers.iter().enumerate() {
                         if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                            let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
+                            let elapsed =
+                                peer.read().await.last_reg_time.elapsed().as_millis() as i64;
                             let states_idx = i / 8;
                             let bit_idx = 7 - i % 8;
                             if elapsed < REG_TIMEOUT {

@@ -8,6 +8,9 @@ use hbbs::{common::*, *};
 const RMEM: usize = 0;
 
 fn main() -> ResultType<()> {
+    management::restore_bans("hbbs")?;
+    let managed = management::load_config("hbbs")?;
+    managed.apply();
     let _logger = Logger::try_with_env_or_str("info")?
         .log_to_stdout()
         .format(opt_format)
@@ -26,8 +29,9 @@ fn main() -> ResultType<()> {
         -k, --key=[KEY] 'Only allow the client with the same key'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
+    managed.apply();
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
-    if port < 3 {
+    if !(3..=65533).contains(&port) {
         bail!("Invalid port");
     }
     let bind_addr = parse_bind_address(&get_arg("bind"))?;

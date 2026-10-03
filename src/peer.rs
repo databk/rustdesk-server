@@ -168,6 +168,27 @@ impl PeerMap {
         tmp
     }
 
+    pub(crate) async fn management_snapshot(&self) -> Vec<serde_json::Value> {
+        let entries: Vec<_> = self
+            .map
+            .read()
+            .await
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .collect();
+        let mut snapshot = Vec::with_capacity(entries.len());
+        for (id, peer) in entries {
+            let peer = peer.read().await;
+            let elapsed = peer.last_reg_time.elapsed().as_secs();
+            let banned = crate::management::is_banned(&id, &peer.info.ip);
+            snapshot.push(serde_json::json!({"id":id,"uuid":base64::encode(&peer.uuid),
+                "address":peer.socket_addr.to_string(),"ip":peer.info.ip,"online":elapsed < 30 && !banned,
+                "last_registration_age_seconds":elapsed,"banned":banned}));
+        }
+        snapshot.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        snapshot
+    }
+
     #[inline]
     pub(crate) async fn get_in_memory(&self, id: &str) -> Option<LockPeer> {
         self.map.read().await.get(id).cloned()
