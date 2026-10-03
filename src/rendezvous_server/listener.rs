@@ -210,7 +210,11 @@ impl RendezvousServer {
                     .and_then(|header_value| header_value.to_str().ok())
                     // X-Forwarded-For can be a comma-separated chain; the
                     // original client is always the first entry.
-                    .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+                    .map(|s| {
+                        crate::management::normalize_client_ip(
+                            s.split(',').next().unwrap_or(s).trim(),
+                        )
+                    })
                     .filter(|s| !s.is_empty());
                 if let Some(ip) = real_ip {
                     *forwarded_ip_cb.lock().unwrap() = Some(ip);

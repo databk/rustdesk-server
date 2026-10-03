@@ -14,7 +14,7 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashMap},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::RwLock,
     time::Instant,
@@ -59,13 +59,24 @@ impl Bans {
     }
 
     fn contains(&self, id: &str, ip: &str) -> bool {
-        let normalized = ip
-            .parse::<IpAddr>()
-            .map(normalize_ip)
-            .unwrap_or_else(|_| ip.to_owned());
+        let normalized = normalize_client_ip(ip);
         (!id.is_empty() && self.device_ids.iter().any(|v| v == id))
             || self.ips.iter().any(|v| v == &normalized)
     }
+}
+
+// Forwarded headers may contain a bare IP, bracketed IPv6 or an endpoint.
+// Preserve malformed values for the existing proxy/header compatibility policy.
+pub fn normalize_client_ip(value: &str) -> String {
+    let candidate = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(value);
+    candidate
+        .parse::<IpAddr>()
+        .or_else(|_| value.parse::<SocketAddr>().map(|addr| addr.ip()))
+        .map(normalize_ip)
+        .unwrap_or_else(|_| value.to_owned())
 }
 
 fn normalize_ip(ip: IpAddr) -> String {
@@ -576,6 +587,31 @@ mod tests {
         assert!(bans.contains("", "192.0.2.1"));
         assert!(!bans.contains("654321", "192.0.2.2"));
         assert_eq!(bans.ips, vec!["192.0.2.1"]);
+    }
+    #[test]
+    fn endpoint_and_bracketed_forwarded_addresses_match_bare_ip_bans() {
+        let bans = Bans {
+            device_ids: vec![],
+            ips: vec!["203.0.113.5".into(), "2001:db8::5".into()],
+        };
+        for ip in [
+            "203.0.113.5",
+            "203.0.113.5:443",
+            "[::ffff:203.0.113.5]:443",
+            "2001:db8::5",
+            "[2001:db8::5]",
+            "[2001:db8::5]:443",
+        ] {
+            assert!(
+                bans.contains("", ip),
+                "forwarded address must match ban: {ip}"
+            );
+        }
+        assert!(!bans.contains("", "203.0.113.6:443"));
+        assert_eq!(
+            normalize_client_ip("unparseable:header"),
+            "unparseable:header"
+        );
     }
     #[test]
     fn bans_cancel_existing_sessions_and_duplicates_are_rejected() {
