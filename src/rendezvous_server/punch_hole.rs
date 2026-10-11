@@ -31,6 +31,7 @@ impl RendezvousServer {
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
             is_udp: socket.is_some(),
+            webrtc_sdp_answer: phs.webrtc_sdp_answer,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -200,6 +201,7 @@ impl RendezvousServer {
                     relay_server,
                     udp_port: ph.udp_port,
                     force_relay: ph.force_relay,
+                    webrtc_sdp_offer: ph.webrtc_sdp_offer,
                     ..Default::default()
                 });
             }

@@ -291,6 +291,10 @@ impl RendezvousServer {
                     }
                     return true;
                 }
+                Some(rendezvous_message::Union::IceCandidate(ice)) => {
+                    self.handle_ice_candidate(ice).await;
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -326,5 +330,51 @@ impl RendezvousServer {
             self.send_to_tcp_sync(msg, addr).await?;
         }
         Ok(())
+    }
+
+    /// Forward a WebRTC ICE candidate to the peer identified by `socket_addr`
+    /// (B → A, the answerer knows the offerer's mangled address) or by `id`
+    /// (A → B, the offerer knows only the peer id). The routing fields are
+    /// stripped before forwarding so neither peer learns the other's address
+    /// from this hop; only `session_key` and `candidate` are delivered.
+    #[inline]
+    async fn handle_ice_candidate(&mut self, ice: IceCandidate) {
+        let target_addr = if !ice.socket_addr.is_empty() {
+            Some(AddrMangle::decode(&ice.socket_addr))
+        } else if !ice.id.is_empty() {
+            if let Some(peer) = self.pm.get_in_memory(&ice.id).await {
+                Some(peer.read().await.socket_addr)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let Some(target_addr) = target_addr else {
+            return;
+        };
+        let msg_out = {
+            let mut m = RendezvousMessage::new();
+            m.set_ice_candidate(IceCandidate {
+                session_key: ice.session_key,
+                candidate: ice.candidate,
+                ..Default::default()
+            });
+            m
+        };
+        let addr_v4 = try_into_v4(target_addr);
+        let sink_arc = self.ws_map.lock().await.get(&addr_v4).cloned();
+        if let Some(sink_arc) = sink_arc {
+            let mut ws_sink = sink_arc.lock().await;
+            Self::send_to_sink(&mut *ws_sink, msg_out).await;
+        } else {
+            let sink_arc = self.tcp_map.lock().await.get(&addr_v4).cloned();
+            if let Some(sink_arc) = sink_arc {
+                let mut tcp_sink = sink_arc.lock().await;
+                Self::send_to_sink(&mut *tcp_sink, msg_out).await;
+            } else {
+                self.tx.send(Data::Msg(msg_out.into(), target_addr)).ok();
+            }
+        }
     }
 }
