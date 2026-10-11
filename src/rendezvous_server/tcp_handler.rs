@@ -39,6 +39,7 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::PunchHoleSent(v)) => v.id.as_str(),
                 Some(rendezvous_message::Union::LocalAddr(v)) => v.id.as_str(),
                 Some(rendezvous_message::Union::RelayResponse(v)) => v.id(),
+                Some(rendezvous_message::Union::IceCandidate(v)) => v.id.as_str(),
                 _ => "",
             };
             if crate::management::is_banned(target_id, "") {
@@ -351,6 +352,9 @@ impl RendezvousServer {
         let Some(target_addr) = target_addr else {
             return;
         };
+        if crate::management::is_banned("", &try_into_v4(target_addr).ip().to_string()) {
+            return;
+        }
         let msg_out = {
             let mut m = RendezvousMessage::new();
             m.set_ice_candidate(IceCandidate {
