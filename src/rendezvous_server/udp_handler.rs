@@ -1,6 +1,5 @@
 use super::*;
 use crate::common::*;
-use crate::peer::*;
 use hbb_common::bytes::BytesMut;
 use hbb_common::{
     log, protobuf::Message as _, rendezvous_proto::*, try_into_v4, udp::FramedSocket, ResultType,
@@ -16,7 +15,7 @@ impl RendezvousServer {
         bytes: &BytesMut,
         addr: SocketAddr,
         socket: &mut FramedSocket,
-        key: &str,
+        _key: &str,
     ) -> ResultType<()> {
         if crate::management::is_banned("", &try_into_v4(addr).ip().to_string()) {
             return Ok(());

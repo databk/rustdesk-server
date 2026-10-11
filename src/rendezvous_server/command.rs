@@ -1,7 +1,5 @@
 use super::*;
-use crate::common::*;
 use crate::peer::*;
-use hbb_common::rendezvous_proto::*;
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 
@@ -126,7 +124,7 @@ impl RendezvousServer {
                 if let Some("-") = arg {
                     lock.clear();
                 } else {
-                    let mut start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                    let start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
                     let mut page_size = fds.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
                     if page_size == 0 {
                         page_size = 10;

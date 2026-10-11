@@ -2,7 +2,7 @@ use super::*;
 use async_speed_limit::Limiter;
 use hbb_common::{
     allow_err, bail,
-    bytes::Bytes,
+
     log,
     protobuf::Message as _,
     rendezvous_proto::*,

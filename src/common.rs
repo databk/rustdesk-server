@@ -279,6 +279,7 @@ pub async fn listen_signal() -> Result<()> {
 }
 
 
+#[allow(dead_code)]
 pub fn check_software_update() {
     const ONE_DAY_IN_SECONDS: u64 = 60 * 60 * 24;
     std::thread::spawn(move || loop {
@@ -287,6 +288,7 @@ pub fn check_software_update() {
     });
 }
 
+#[allow(dead_code)]
 #[tokio::main(flavor = "current_thread")]
 async fn check_software_update_() -> hbb_common::ResultType<()> {
     let (request, url) = hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_SERVER.to_string());

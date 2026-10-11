@@ -2,10 +2,8 @@ use super::*;
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
-    allow_err, config,
-    futures_util::stream::StreamExt,
+    allow_err,
     log,
-    rendezvous_proto::*,
     tokio::{
         self,
         net::TcpListener,

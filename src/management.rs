@@ -93,6 +93,7 @@ pub fn is_banned(id: &str, ip: &str) -> bool {
     BANS.read().unwrap().contains(id, ip)
 }
 
+#[allow(dead_code)]
 pub fn set_peers(peers: Vec<Value>) {
     *PEERS.write().unwrap() = peers;
 }

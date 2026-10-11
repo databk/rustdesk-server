@@ -4,11 +4,10 @@ mod helper;
 mod server;
 mod stream;
 
-use async_speed_limit::Limiter;
 use hbb_common::tokio::sync::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::AtomicUsize,
 };
 
 pub use server::start_with_bind;

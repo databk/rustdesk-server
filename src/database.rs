@@ -36,6 +36,7 @@ pub struct Database {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 pub struct Peer {
     pub guid: Vec<u8>,
     pub id: String,

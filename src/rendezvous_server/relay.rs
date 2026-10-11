@@ -4,7 +4,7 @@ use hbb_common::{
     config,
     futures::future::join_all,
     log,
-    rendezvous_proto::*,
+
     tcp::FramedStream,
     tokio::sync::Mutex,
 };

@@ -13,7 +13,6 @@ use crate::peer::*;
 use hbb_common::{
     bytes::Bytes,
     bytes_codec::BytesCodec,
-    protobuf::MessageField,
     rendezvous_proto::*,
     tcp::Encrypt,
     tokio::{
@@ -22,8 +21,6 @@ use hbb_common::{
         sync::{mpsc, Mutex},
     },
     tokio_util::codec::Framed,
-    udp::FramedSocket,
-    ResultType,
 };
 use ipnetwork::Ipv4Network;
 use sodiumoxide::crypto::sign;

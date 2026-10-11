@@ -1,6 +1,4 @@
 use super::*;
-use crate::common::*;
-use crate::peer::*;
 use hbb_common::tokio::sync::Mutex;
 use hbb_common::{
     allow_err,

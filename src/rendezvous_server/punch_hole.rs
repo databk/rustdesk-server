@@ -1,6 +1,5 @@
 use super::*;
-use crate::common::*;
-use crate::peer::*;
+
 use hbb_common::bytes::BytesMut;
 use hbb_common::{
     log, rendezvous_proto::*, tcp::FramedStream, try_into_v4, udp::FramedSocket, AddrMangle,

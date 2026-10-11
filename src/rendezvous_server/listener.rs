@@ -1,6 +1,4 @@
 use super::*;
-use crate::common::*;
-use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
     bytes::Bytes,
@@ -9,20 +7,18 @@ use hbb_common::{
     log,
     protobuf::Message as _,
     rendezvous_proto::*,
-    tcp::{Encrypt, FramedStream},
+    tcp::Encrypt,
     timeout,
     tokio::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
-        sync::Mutex,
     },
     tokio_util::codec::Framed,
     try_into_v4, ResultType,
 };
 use sodiumoxide::crypto::{box_, sign};
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 impl RendezvousServer {
     pub(crate) async fn handle_listener2(&self, stream: TcpStream, addr: SocketAddr) {
@@ -182,12 +178,11 @@ impl RendezvousServer {
     async fn handle_listener_inner(
         &mut self,
         stream: TcpStream,
-        mut addr: SocketAddr,
+        addr: SocketAddr,
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
-        let mut forwarded_ip: Option<String> = None;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let forwarded_ip_cell: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -222,7 +217,7 @@ impl RendezvousServer {
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-            forwarded_ip = forwarded_ip_cell.lock().unwrap().clone();
+            let forwarded_ip = forwarded_ip_cell.lock().unwrap().clone();
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             while let Ok(Some(res)) = timeout(30_000, b.next()).await {
