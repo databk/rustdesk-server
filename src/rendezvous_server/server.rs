@@ -91,6 +91,19 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        // Register the hbbs handlers for schema entries marked as dynamic.
+        {
+            let tx = rs.tx.clone();
+            crate::management::set_dynamic_apply(Box::new(move |name, value| match name {
+                "always-use-relay" => {
+                    let enabled = value.eq_ignore_ascii_case("Y");
+                    ALWAYS_USE_RELAY.store(enabled, std::sync::atomic::Ordering::SeqCst);
+                    true
+                }
+                "relay-servers" => tx.send(Data::RelayServers0(value.to_owned())).is_ok(),
+                _ => false,
+            }));
+        }
         let mut listener = helper::create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = helper::create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = helper::create_tcp_listener(bind_addr, ws_port).await?;

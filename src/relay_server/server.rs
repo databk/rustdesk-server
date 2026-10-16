@@ -51,6 +51,7 @@ pub async fn start_with_bind(bind_addr: Option<IpAddr>, port: &str, key: &str) -
             let console = crate::common::listen_console(bind_addr, port).await?;
             if !management_started {
                 crate::management::start("hbbr", port)?;
+                crate::management::set_dynamic_apply(Box::new(command::apply_dynamic));
                 management_started = true;
             }
             connection::io_loop(listener, websocket, console, &key).await;

@@ -1561,6 +1561,7 @@ dependencies = [
  "hbb_common",
  "headers",
  "http 0.2.12",
+ "hyper 0.14.32",
  "ipnetwork",
  "jsonwebtoken",
  "lazy_static",
