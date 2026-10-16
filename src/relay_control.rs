@@ -1,8 +1,9 @@
 //! Reverse control channel client. When RD_HBBS_API_URL is set, hbbr connects
 //! to the hbbs management API over WebSocket, registers itself, reports
-//! heartbeats and session events, and receives policy commands (bans,
-//! session disconnect, snapshot requests). The connection is outbound-only so
-//! hbbr never exposes a management listener for aggregation.
+//! heartbeats and session events, receives policy commands (bans, session
+//! disconnect, snapshot requests) and answers proxied management requests
+//! (configuration reads and writes, log reads, restart). The connection is
+//! outbound-only so hbbr never exposes a management listener for aggregation.
 use crate::management;
 use hbb_common::futures_util::{sink::SinkExt as _, stream::StreamExt as _};
 use hbb_common::{anyhow::anyhow, log, tokio, ResultType};
@@ -43,7 +44,11 @@ fn relay_identity() -> (String, String) {
     let id = std::env::var("RD_RELAY_ID")
         .ok()
         .filter(|value| !value.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok().filter(|value| !value.is_empty()))
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "hbbr".to_owned());
     let address = std::env::var("RD_RELAY_ADDRESS")
         .ok()
@@ -68,9 +73,7 @@ async fn run(url: &str, token: &str) -> ResultType<()> {
             "version": crate::version::VERSION,
         }
     });
-    socket
-        .send(Message::Text(register.to_string()))
-        .await?;
+    socket.send(Message::Text(register.to_string())).await?;
     let mut events = management::take_control_receiver();
     let started = Instant::now();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -128,6 +131,7 @@ async fn run(url: &str, token: &str) -> ResultType<()> {
 
 async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()> {
     let message: Value = serde_json::from_str(text)?;
+    let id = message["id"].clone();
     match message["type"].as_str() {
         Some("bans") => {
             let bans: management::Bans = serde_json::from_value(message["bans"].clone())?;
@@ -147,7 +151,84 @@ async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()
                 management::disconnect_session(uuid);
             }
         }
+        // The remaining commands are proxied management requests: hbbs
+        // forwards relay-scoped reads and writes and awaits the matching
+        // response, so each command answers with an HTTP-equivalent status
+        // and body.
+        Some("get_config") => {
+            respond(socket, &id, 200, management::config_view("hbbr")).await?;
+        }
+        Some("set_config") => {
+            let update = match serde_json::from_value::<management::ConfigUpdate>(json!({
+                "values": message["values"].clone()
+            })) {
+                Ok(update) => update,
+                Err(err) => {
+                    respond(socket, &id, 400, json!({"error": err.to_string()})).await?;
+                    return Ok(());
+                }
+            };
+            if let Some(err) = management::validate_update("hbbr", &update) {
+                respond(socket, &id, 400, json!({"error": err})).await?;
+                return Ok(());
+            }
+            match management::apply_config_update("hbbr", update).await {
+                Ok((applied, pending_restart)) => {
+                    respond(
+                        socket,
+                        &id,
+                        200,
+                        json!({"state":"saved","applied":applied,"pending_restart":pending_restart}),
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    log::error!("Unable to persist managed configuration: {err}");
+                    respond(socket, &id, 500, json!({"error": err.to_string()})).await?;
+                }
+            }
+        }
+        Some("get_logs") => {
+            let tail = message["tail"]
+                .as_u64()
+                .unwrap_or(200)
+                .min(management::LOG_CAPACITY as u64) as usize;
+            respond(socket, &id, 200, management::logs_view(tail)).await?;
+        }
+        Some("restart") => {
+            respond(socket, &id, 202, json!({"state":"restarting"})).await?;
+            schedule_restart();
+        }
         _ => {}
     }
     Ok(())
+}
+
+// Answers a proxied request on the same control socket; hbbs correlates the
+// exchange by request id and forwards the status and body to its client.
+async fn respond(
+    socket: &mut ControlSocket,
+    id: &Value,
+    status: u16,
+    body: Value,
+) -> ResultType<()> {
+    let response = json!({
+        "type": "response",
+        "id": id,
+        "status": status,
+        "body": body,
+    });
+    socket.send(Message::Text(response.to_string())).await?;
+    Ok(())
+}
+
+// Exits after the acknowledgement is flushed; the supervisor (container
+// restart policy or systemd) brings the relay back with the persisted
+// configuration and pending-restart entries applied.
+fn schedule_restart() {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        log::info!("Exiting for restart; the supervisor should bring the relay back");
+        std::process::exit(0);
+    });
 }

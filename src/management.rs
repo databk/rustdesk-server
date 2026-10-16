@@ -154,6 +154,57 @@ fn fanout_bans() {
     }
 }
 
+// Pending request-response exchanges with registered relays: hbbs HTTP
+// handlers await the completion channel while the relay socket loop resolves
+// it from the "response" control message.
+struct PendingRelayRequest {
+    relay: String,
+    responder: oneshot::Sender<Value>,
+}
+
+static RELAY_REQUESTS: Lazy<std::sync::Mutex<HashMap<u64, PendingRelayRequest>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+static RELAY_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Sends a command carrying a request id to one relay and awaits the matching
+// response, so HTTP handlers can proxy relay-scoped reads and writes.
+async fn relay_request(relay_id: &str, mut payload: Value) -> ResultType<Value> {
+    let (responder, waiter) = oneshot::channel();
+    let id = RELAY_REQUEST_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("id".to_owned(), json!(id));
+    }
+    RELAY_REQUESTS.lock().unwrap().insert(
+        id,
+        PendingRelayRequest {
+            relay: relay_id.to_owned(),
+            responder,
+        },
+    );
+    if let Err(err) = relay_command(relay_id, payload) {
+        RELAY_REQUESTS.lock().unwrap().remove(&id);
+        return Err(err);
+    }
+    match tokio::time::timeout(RELAY_REQUEST_TIMEOUT, waiter).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(anyhow!("Relay control channel closed")),
+        Err(_) => {
+            RELAY_REQUESTS.lock().unwrap().remove(&id);
+            Err(anyhow!("Relay did not answer in time"))
+        }
+    }
+}
+
+// Drops the pending exchanges of one relay; awaiting requests fail fast
+// instead of waiting for the timeout.
+fn cancel_relay_requests(relay_id: &str) {
+    RELAY_REQUESTS
+        .lock()
+        .unwrap()
+        .retain(|_, pending| pending.relay != relay_id);
+}
+
 // Outbound relay-side events (session lifecycle) consumed by the hbbr control
 // client. Only meaningful inside the hbbr binary; sends without a consumer
 // are dropped.
@@ -413,7 +464,6 @@ struct ApiState {
     service: &'static str,
     token: String,
     started: Instant,
-
 }
 
 async fn authorize(request: Request<Body>, next: Next<Body>) -> Response {
@@ -447,7 +497,9 @@ async fn status(Extension(state): Extension<ApiState>) -> Json<Value> {
     )
 }
 
-async fn config(Extension(state): Extension<ApiState>) -> Json<Value> {
+// Live configuration view: schema, effective values and the pending restart
+// diff. Shared by the HTTP endpoint and the relay control channel.
+pub fn config_view(service: &str) -> Value {
     let managed = MANAGED.read().unwrap();
     let mut pending = Map::new();
     for (name, value) in &managed.pending {
@@ -459,16 +511,18 @@ async fn config(Extension(state): Extension<ApiState>) -> Json<Value> {
             }),
         );
     }
-    Json(
-        json!({"schema":schema(state.service),"values":managed.values.clone(),
-        "pending_restart":pending}),
-    )
+    json!({"schema":schema(service),"values":managed.values.clone(),
+    "pending_restart":pending})
+}
+
+async fn config(Extension(state): Extension<ApiState>) -> Json<Value> {
+    Json(config_view(state.service))
 }
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ConfigUpdate {
-    values: BTreeMap<String, String>,
+pub struct ConfigUpdate {
+    pub values: BTreeMap<String, String>,
 }
 
 fn definition_of(definitions: &[Value], name: &str) -> Option<Value> {
@@ -479,102 +533,118 @@ fn definition_of(definitions: &[Value], name: &str) -> Option<Value> {
 }
 
 fn bad_request(message: String) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": message})),
-    )
-        .into_response()
+    (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response()
+}
+
+// Validates a submission against the schema without touching any state.
+// Returns the first violation as a message so callers can map it to their
+// transport (HTTP bad request or a control channel error response).
+pub fn validate_update(service: &str, update: &ConfigUpdate) -> Option<String> {
+    let definitions = schema(service);
+    for (name, value) in &update.values {
+        let Some(definition) = definition_of(&definitions, name) else {
+            return Some(format!("Unknown managed configuration: {name}"));
+        };
+        if definition["secret"] == true && value == REDACTED {
+            continue;
+        }
+        if let Err(err) = validate_value(&definition, name, value) {
+            return Some(err.to_string());
+        }
+    }
+    None
+}
+
+// Validates, persists and activates a managed configuration update. Shared
+// by the HTTP handler and the relay control channel (hbbr applies the
+// updates forwarded by hbbs). The caller retains the update through
+// persistence and activation even if it disconnects while the blocking
+// filesystem work is in flight.
+pub async fn apply_config_update(
+    service: &'static str,
+    update: ConfigUpdate,
+) -> ResultType<(Map<String, Value>, Map<String, Value>)> {
+    let definitions = schema(service);
+    let _update = CONFIG_UPDATES.lock().await;
+    let (mut values, mut overrides, mut pending) = {
+        let managed = MANAGED.read().unwrap();
+        (
+            managed.values.clone(),
+            managed.overrides.clone(),
+            managed.pending.clone(),
+        )
+    };
+    for (name, value) in &update.values {
+        let Some(definition) = definition_of(&definitions, name) else {
+            continue;
+        };
+        if definition["secret"] == true && value == REDACTED {
+            continue;
+        }
+        overrides.insert(name.clone(), value.clone());
+    }
+    // Persist before activation; a write failure keeps the running state.
+    let persisted = overrides.clone();
+    tokio::task::spawn_blocking(move || persist_config(service, &persisted)).await??;
+    let mut applied = Map::new();
+    let mut pending_report = Map::new();
+    for (name, value) in &overrides {
+        let Some(definition) = definition_of(&definitions, name) else {
+            continue;
+        };
+        let secret = definition["secret"] == true;
+        // Secrets cannot be compared against the running value because the
+        // effective view is redacted; only resubmitted secrets are reported.
+        if secret && !update.values.contains_key(name) {
+            continue;
+        }
+        let display = if secret {
+            REDACTED.to_owned()
+        } else {
+            value.clone()
+        };
+        if !secret && values.get(name) == Some(&display) {
+            pending.remove(name);
+            continue;
+        }
+        if definition["dynamic"] == true && apply_dynamic(name, value) {
+            values.insert(name.clone(), display.clone());
+            pending.remove(name);
+            applied.insert(name.clone(), json!(display));
+        } else {
+            let current = values.get(name).cloned().unwrap_or_default();
+            pending.insert(name.clone(), display.clone());
+            pending_report.insert(
+                name.clone(),
+                json!({"current": current, "pending": display}),
+            );
+        }
+    }
+    *MANAGED.write().unwrap() = ManagedState {
+        values,
+        overrides,
+        pending,
+    };
+    Ok((applied, pending_report))
 }
 
 async fn replace_config(
     Extension(state): Extension<ApiState>,
     Json(update): Json<ConfigUpdate>,
 ) -> Response {
-    // Validate the submission against the schema before touching any state.
-    let definitions = schema(state.service);
-    for (name, value) in &update.values {
-        let Some(definition) = definition_of(&definitions, name) else {
-            return bad_request(format!("Unknown managed configuration: {name}"));
-        };
-        if definition["secret"] == true && value == REDACTED {
-            continue;
-        }
-        if let Err(err) = validate_value(&definition, name, value) {
-            return bad_request(err.to_string());
-        }
+    if let Some(err) = validate_update(state.service, &update) {
+        return bad_request(err);
     }
     let service = state.service;
-    // The task owns the update through persistence and activation even if the
-    // HTTP caller disconnects while the blocking filesystem work is in flight.
-    let result = tokio::spawn(async move {
-        let _update = CONFIG_UPDATES.lock().await;
-        let (mut values, mut overrides, mut pending) = {
-            let managed = MANAGED.read().unwrap();
-            (
-                managed.values.clone(),
-                managed.overrides.clone(),
-                managed.pending.clone(),
-            )
-        };
-        for (name, value) in &update.values {
-            let Some(definition) = definition_of(&definitions, name) else {
-                continue;
-            };
-            if definition["secret"] == true && value == REDACTED {
-                continue;
-            }
-            overrides.insert(name.clone(), value.clone());
-        }
-        // Persist before activation; a write failure keeps the running state.
-        let persisted = overrides.clone();
-        tokio::task::spawn_blocking(move || persist_config(service, &persisted)).await??;
-        let mut applied = Map::new();
-        let mut pending_report = Map::new();
-        for (name, value) in &overrides {
-            let Some(definition) = definition_of(&definitions, name) else {
-                continue;
-            };
-            let secret = definition["secret"] == true;
-            // Secrets cannot be compared against the running value because the
-            // effective view is redacted; only resubmitted secrets are reported.
-            if secret && !update.values.contains_key(name) {
-                continue;
-            }
-            let display = if secret {
-                REDACTED.to_owned()
-            } else {
-                value.clone()
-            };
-            if !secret && values.get(name) == Some(&display) {
-                pending.remove(name);
-                continue;
-            }
-            if definition["dynamic"] == true && apply_dynamic(name, value) {
-                values.insert(name.clone(), display.clone());
-                pending.remove(name);
-                applied.insert(name.clone(), json!(display));
-            } else {
-                let current = values.get(name).cloned().unwrap_or_default();
-                pending.insert(name.clone(), display.clone());
-                pending_report.insert(
-                    name.clone(),
-                    json!({"current": current, "pending": display}),
-                );
-            }
-        }
-        *MANAGED.write().unwrap() = ManagedState {
-            values,
-            overrides,
-            pending,
-        };
-        Ok::<_, hbb_common::anyhow::Error>((applied, pending_report))
-    })
-    .await;
+    // The task owns the update through persistence and activation even if
+    // the HTTP caller disconnects while the blocking filesystem work is in
+    // flight.
+    let result = tokio::spawn(apply_config_update(service, update)).await;
     match result {
-        Ok(Ok((applied, pending_report))) => Json(
-            json!({"state":"saved","applied":applied,"pending_restart":pending_report}),
-        )
-        .into_response(),
+        Ok(Ok((applied, pending_report))) => {
+            Json(json!({"state":"saved","applied":applied,"pending_restart":pending_report}))
+                .into_response()
+        }
         Ok(Err(err)) => {
             log::error!("Unable to persist managed configuration: {err}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -629,12 +699,30 @@ struct LogsQuery {
     tail: Option<usize>,
 }
 
-async fn logs(Query(query): Query<LogsQuery>) -> Response {
-    let tail = query.tail.unwrap_or(200).min(LOG_CAPACITY);
+// Recent in-memory log lines. Shared by the HTTP endpoint and the relay
+// control channel (hbbs proxies relay log reads over the control channel).
+pub fn logs_view(tail: usize) -> Value {
+    let tail = tail.min(LOG_CAPACITY);
     let logs = LOGS.read().unwrap();
     let skipped = logs.len().saturating_sub(tail);
     let data: Vec<String> = logs.iter().skip(skipped).cloned().collect();
-    Json(json!({"data": data})).into_response()
+    json!({"data": data})
+}
+
+async fn logs(Query(query): Query<LogsQuery>) -> Response {
+    Json(logs_view(query.tail.unwrap_or(200))).into_response()
+}
+
+// Ask the supervisor (container restart policy or systemd) to bring the
+// service back: flush the response, then exit. Dynamic configuration is
+// already active; pending entries take effect on the next startup.
+async fn restart() -> Response {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        log::info!("Exiting for restart; the supervisor should bring the service back");
+        std::process::exit(0);
+    });
+    (StatusCode::ACCEPTED, Json(json!({"state":"restarting"}))).into_response()
 }
 
 async fn peers(Extension(state): Extension<ApiState>) -> Response {
@@ -805,7 +893,6 @@ pub fn start(service: &'static str, port: u16) -> ResultType<()> {
     Ok(())
 }
 
-
 // Reverse control channel: hbbr connects here (hbbs only), registers itself,
 // reports heartbeats and session events, and receives policy commands.
 async fn control(Extension(state): Extension<ApiState>, ws: WebSocketUpgrade) -> Response {
@@ -933,6 +1020,8 @@ async fn control_socket(mut socket: WebSocket) {
             log::info!("Relay {relay_id} left the control channel");
             emit_event("relay_disconnected", json!({"id": relay_id}));
             sync_relay_list();
+            // Pending exchanges die with the connection; waiters fail fast.
+            cancel_relay_requests(&relay_id);
         }
     }
 }
@@ -968,6 +1057,14 @@ fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
             }
             let kind = event["kind"].as_str().unwrap_or("relay_event").to_owned();
             emit_event(&kind, event);
+        }
+        Some("response") => {
+            // Complete the pending relay_request awaiting this exchange.
+            if let Some(id) = message["id"].as_u64() {
+                if let Some(pending) = RELAY_REQUESTS.lock().unwrap().remove(&id) {
+                    let _ = pending.responder.send(message);
+                }
+            }
         }
         _ => {}
     }
@@ -1025,6 +1122,85 @@ async fn relay_disconnect(
     }
 }
 
+fn relay_available(relay_id: &str) -> bool {
+    RELAYS.read().unwrap().contains_key(relay_id)
+}
+
+// The relay answered with an HTTP-equivalent status and body; forward both so
+// the proxy endpoints keep the semantics of the direct ones.
+fn relay_response(result: ResultType<Value>) -> Response {
+    match result {
+        Ok(response) => {
+            let status = response["status"]
+                .as_u64()
+                .and_then(|code| StatusCode::from_u16(code as u16).ok())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            (status, Json(response["body"].clone())).into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": err.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// Relay-scoped proxies: management clients talk to hbbs only; hbbs forwards
+// configuration and log requests to the target relay over the control channel.
+async fn relay_config(
+    Extension(state): Extension<ApiState>,
+    Path(relay_id): Path<String>,
+) -> Response {
+    if state.service != "hbbs" || !relay_available(&relay_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    relay_response(relay_request(&relay_id, json!({"type": "get_config"})).await)
+}
+
+async fn relay_replace_config(
+    Extension(state): Extension<ApiState>,
+    Path(relay_id): Path<String>,
+    Json(update): Json<ConfigUpdate>,
+) -> Response {
+    if state.service != "hbbs" || !relay_available(&relay_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    relay_response(
+        relay_request(
+            &relay_id,
+            json!({"type": "set_config", "values": update.values}),
+        )
+        .await,
+    )
+}
+
+async fn relay_logs(
+    Extension(state): Extension<ApiState>,
+    Path(relay_id): Path<String>,
+    Query(query): Query<LogsQuery>,
+) -> Response {
+    if state.service != "hbbs" || !relay_available(&relay_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let tail = query.tail.unwrap_or(200).min(LOG_CAPACITY);
+    relay_response(relay_request(&relay_id, json!({"type": "get_logs", "tail": tail})).await)
+}
+
+// Restart is fire-and-forget: the relay exits right after acknowledging, so
+// there is no stable connection left to answer a correlated request.
+async fn relay_restart(
+    Extension(state): Extension<ApiState>,
+    Path(relay_id): Path<String>,
+) -> Response {
+    if state.service != "hbbs" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match relay_command(&relay_id, json!({"type": "restart"})) {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"restarting"}))).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 // Aggregated server-sent event stream: peer online/offline, relay session
 // lifecycle, relay registration and policy changes.
 async fn events() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>> {
@@ -1066,6 +1242,7 @@ fn router(state: ApiState) -> Router {
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/:uuid", axum::routing::delete(disconnect))
         .route("/v1/bans", get(bans).put(replace_bans))
+        .route("/v1/restart", axum::routing::post(restart))
         .route("/v1/events", get(events))
         .route("/v1/control", get(control))
         .route("/v1/relays", get(relays))
@@ -1074,6 +1251,12 @@ fn router(state: ApiState) -> Router {
             "/v1/relays/:id/sessions/:uuid",
             axum::routing::delete(relay_disconnect),
         )
+        .route(
+            "/v1/relays/:id/config",
+            get(relay_config).put(relay_replace_config),
+        )
+        .route("/v1/relays/:id/logs", get(relay_logs))
+        .route("/v1/relays/:id/restart", axum::routing::post(relay_restart))
         .layer(middleware::from_fn(authorize))
         .layer(Extension(state))
 }
@@ -1138,7 +1321,6 @@ mod tests {
             service: "hbbs",
             token: "test".into(),
             started: Instant::now(),
-
         };
         let a = Bans {
             device_ids: vec!["policy-a".into()],
@@ -1206,7 +1388,6 @@ mod tests {
             service: "hbbs",
             token: token.into(),
             started: Instant::now(),
-
         });
         let task = tokio::spawn(
             axum::Server::from_tcp(listener)
@@ -1265,7 +1446,10 @@ mod tests {
         EVENTS.subscribe()
     }
 
-    fn register_test_relay(relay_id: &str, address: Option<&str>) -> mpsc::UnboundedReceiver<Message> {
+    fn register_test_relay(
+        relay_id: &str,
+        address: Option<&str>,
+    ) -> mpsc::UnboundedReceiver<Message> {
         let (tx, rx) = mpsc::unbounded_channel();
         RELAYS.write().unwrap().insert(
             relay_id.to_owned(),
@@ -1371,20 +1555,19 @@ mod tests {
                 version: "test".to_owned(),
                 generation,
                 started: Instant::now(),
-                last_heartbeat: Instant::now()
-                    - Duration::from_secs(120),
+                last_heartbeat: Instant::now() - Duration::from_secs(120),
                 sessions: Vec::new(),
                 tx,
             },
         );
         let mut events = subscribe_events();
-        handle_control_message(
-            "relay-b",
-            generation,
-            r#"{"type":"heartbeat"}"#,
-        );
+        handle_control_message("relay-b", generation, r#"{"type":"heartbeat"}"#);
         assert!(
-            RELAYS.read().unwrap()["relay-b"].last_heartbeat.elapsed().as_secs() < 45,
+            RELAYS.read().unwrap()["relay-b"]
+                .last_heartbeat
+                .elapsed()
+                .as_secs()
+                < 45,
             "heartbeat must refresh the liveness timestamp"
         );
         handle_control_message(
@@ -1518,11 +1701,12 @@ mod tests {
         assert_eq!(managed.values.get("limit-speed").unwrap(), "64");
         assert_eq!(managed.values.get("port").unwrap(), "21117");
         assert_eq!(managed.pending.get("port").unwrap(), "21118");
-        let persisted: ManagedConfig = serde_json::from_slice(
-            &std::fs::read(data_path("hbbr", "config")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(persisted.values, managed_values(&[("limit-speed", "64"), ("port", "21118")]));
+        let persisted: ManagedConfig =
+            serde_json::from_slice(&std::fs::read(data_path("hbbr", "config")).unwrap()).unwrap();
+        assert_eq!(
+            persisted.values,
+            managed_values(&[("limit-speed", "64"), ("port", "21118")])
+        );
         // The live config view reflects the dynamic change and the pending entry.
         let view = config(Extension(ConfigFixture::state("hbbr"))).await;
         assert_eq!(view["values"]["limit-speed"], "64");
@@ -1612,14 +1796,9 @@ mod tests {
                 .unwrap();
         assert_eq!(body["pending_restart"]["key"]["pending"], REDACTED);
         assert!(!format!("{body:?}").contains("replacement-secret"));
-        let persisted: ManagedConfig = serde_json::from_slice(
-            &std::fs::read(data_path("hbbr", "config")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            persisted.values.get("key").unwrap(),
-            "replacement-secret"
-        );
+        let persisted: ManagedConfig =
+            serde_json::from_slice(&std::fs::read(data_path("hbbr", "config")).unwrap()).unwrap();
+        assert_eq!(persisted.values.get("key").unwrap(), "replacement-secret");
         // Resubmitting the placeholder keeps the stored secret untouched.
         let response = replace_config(
             Extension(ConfigFixture::state("hbbr")),
@@ -1629,14 +1808,9 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let persisted: ManagedConfig = serde_json::from_slice(
-            &std::fs::read(data_path("hbbr", "config")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            persisted.values.get("key").unwrap(),
-            "replacement-secret"
-        );
+        let persisted: ManagedConfig =
+            serde_json::from_slice(&std::fs::read(data_path("hbbr", "config")).unwrap()).unwrap();
+        assert_eq!(persisted.values.get("key").unwrap(), "replacement-secret");
     }
 
     #[tokio::test]
@@ -1661,5 +1835,95 @@ mod tests {
         assert!(truncated.len() <= LOG_LINE_LIMIT + 3);
         // Reset the ring for other tests.
         LOGS.write().unwrap().clear();
+    }
+    #[tokio::test]
+    async fn relay_requests_proxy_config_logs_and_restart() {
+        let _test = POLICY_TEST.lock().unwrap();
+        let _fixture = ConfigFixture::new();
+        clear_relays();
+        let state = ConfigFixture::state("hbbs");
+        // Unknown relays are reported as missing.
+        let missing = relay_config(Extension(state.clone()), Path("missing".to_owned())).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let mut receiver = register_test_relay("relay-c", None);
+        let generation = RELAYS.read().unwrap()["relay-c"].generation;
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<String>();
+        // A background task plays the relay: every command is answered with
+        // an HTTP-equivalent status and body through the control socket loop.
+        let responder = tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let payload: Value = serde_json::from_str(&text).unwrap();
+                let kind = payload["type"].as_str().unwrap().to_owned();
+                let _ = seen_tx.send(kind.clone());
+                let id = payload["id"].clone();
+                let response = match kind.as_str() {
+                    "get_config" => json!({"type":"response","id":id,"status":200,
+                        "body":{"values":{"limit-speed":"64"}}}),
+                    "get_logs" => json!({"type":"response","id":id,"status":200,
+                        "body":{"data":["relay-log-line"]}}),
+                    "set_config" => json!({"type":"response","id":id,"status":400,
+                        "body":{"error":"invalid value"}}),
+                    "restart" => break,
+                    _ => continue,
+                };
+                handle_control_message("relay-c", generation, &response.to_string());
+            }
+        });
+        let response = relay_config(Extension(state.clone()), Path("relay-c".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body["values"]["limit-speed"], "64");
+        let response = relay_logs(
+            Extension(state.clone()),
+            Path("relay-c".to_owned()),
+            Query(LogsQuery { tail: Some(5) }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body["data"][0], "relay-log-line");
+        // Relay-reported statuses flow through (e.g. validation errors).
+        let response = relay_replace_config(
+            Extension(state.clone()),
+            Path("relay-c".to_owned()),
+            Json(ConfigUpdate {
+                values: managed_values(&[("limit-speed", "64")]),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"], "invalid value");
+        // Restart is fire-and-forget.
+        let response = relay_restart(Extension(state.clone()), Path("relay-c".to_owned())).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        for expected in ["get_config", "get_logs", "set_config", "restart"] {
+            assert_eq!(seen_rx.recv().await.unwrap(), expected);
+        }
+        responder.abort();
+        clear_relays();
+    }
+
+    #[test]
+    fn cancelling_relay_requests_releases_waiters() {
+        let (responder, waiter) = oneshot::channel();
+        RELAY_REQUESTS.lock().unwrap().insert(
+            987_654,
+            PendingRelayRequest {
+                relay: "relay-y".to_owned(),
+                responder,
+            },
+        );
+        cancel_relay_requests("relay-y");
+        assert!(waiter.blocking_recv().is_err());
     }
 }
