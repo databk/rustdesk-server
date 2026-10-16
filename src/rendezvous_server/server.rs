@@ -91,6 +91,25 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        // Fold relay addresses discovered through the control channel back
+        // into the live relay server list (static configuration plus
+        // registered relays).
+        {
+            let tx = rs.tx.clone();
+            let static_relays = std::sync::Arc::new(std::sync::Mutex::new(get_arg(
+                "relay-servers",
+            )));
+            let base = static_relays.clone();
+            crate::management::set_relay_sync(Box::new(move |registered: Vec<String>| {
+                let mut list = base.lock().unwrap().clone();
+                for address in registered {
+                    merge_relay_servers(&mut list, &address);
+                }
+                if tx.send(Data::RelayServers0(list)).is_err() {
+                    log::warn!("Unable to update the live relay server list");
+                }
+            }));
+        }
         let mut listener = helper::create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = helper::create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = helper::create_tcp_listener(bind_addr, ws_port).await?;
@@ -278,4 +297,20 @@ impl RendezvousServer {
             }
         }
     }
+}
+
+fn merge_relay_servers(list: &mut String, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut entries: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if !entries.iter().any(|entry| entry == extra) {
+        entries.push(extra.to_owned());
+    }
+    *list = entries.join(",");
 }
