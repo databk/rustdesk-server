@@ -3,6 +3,53 @@ use async_speed_limit::Limiter;
 use hbb_common::log;
 use std::sync::atomic::Ordering;
 
+// Applies schema entries marked as dynamic for the relay server. Values use
+// schema units and are converted exactly like the startup parameters.
+pub(crate) fn apply_dynamic(name: &str, value: &str) -> bool {
+    match name {
+        "downgrade-threshold" => match value.parse::<f64>() {
+            Ok(v) if v > 0. => {
+                DOWNGRADE_THRESHOLD_100.store((v * 100.) as _, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        },
+        "downgrade-start-check" => match value.parse::<usize>() {
+            Ok(v) if v > 0 => {
+                DOWNGRADE_START_CHECK.store(v * 1000, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        },
+        "limit-speed" => match value.parse::<f64>() {
+            Ok(v) if v > 0. => {
+                LIMIT_SPEED.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        },
+        "total-bandwidth" => match value.parse::<f64>() {
+            Ok(v) if v > 0. => {
+                let bits = (v * 1024. * 1024.) as usize;
+                TOTAL_BANDWIDTH.store(bits, Ordering::SeqCst);
+                if let Some(limiter) = &*TOTAL_LIMITER.read().unwrap() {
+                    limiter.set_speed_limit(bits as _);
+                }
+                true
+            }
+            _ => false,
+        },
+        "single-bandwidth" => match value.parse::<f64>() {
+            Ok(v) if v > 0. => {
+                SINGLE_BANDWIDTH.store((v * 1024. * 1024.) as _, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 pub(crate) fn check_params() {
     let tmp = crate::common::get_arg("DOWNGRADE_THRESHOLD")
         .parse::<f64>()

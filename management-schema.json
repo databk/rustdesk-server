@@ -1,11 +1,12 @@
 {
-  "version": 1,
+  "version": 2,
   "hbbs": [
     {
       "name": "port",
       "default": "21116",
       "kind": "integer",
       "secret": false,
+      "dynamic": false,
       "restart_required": true,
       "minimum": 3,
       "maximum": 65533
@@ -15,6 +16,7 @@
       "default": "",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -22,13 +24,15 @@
       "default": "",
       "kind": "string",
       "secret": false,
-      "restart_required": true
+      "dynamic": true,
+      "restart_required": false
     },
     {
       "name": "key",
       "default": "-",
       "kind": "string",
       "secret": true,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -36,6 +40,7 @@
       "default": "0",
       "kind": "integer",
       "secret": false,
+      "dynamic": false,
       "restart_required": true,
       "minimum": 0,
       "maximum": 2147483647
@@ -45,6 +50,7 @@
       "default": "0",
       "kind": "integer",
       "secret": false,
+      "dynamic": false,
       "restart_required": true,
       "minimum": 0,
       "maximum": 2147483647
@@ -54,6 +60,7 @@
       "default": "",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -61,6 +68,7 @@
       "default": "",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -68,6 +76,7 @@
       "default": "",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -75,6 +84,7 @@
       "default": "",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -82,6 +92,7 @@
       "default": "./db_v2.sqlite3",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -89,6 +100,7 @@
       "default": "1",
       "kind": "integer",
       "secret": false,
+      "dynamic": false,
       "restart_required": true,
       "minimum": 1,
       "maximum": 1024
@@ -98,6 +110,7 @@
       "default": "",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -105,13 +118,15 @@
       "default": "N",
       "kind": "relay-mode",
       "secret": false,
-      "restart_required": true
+      "dynamic": true,
+      "restart_required": false
     },
     {
       "name": "log",
       "default": "info",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     }
   ],
@@ -121,6 +136,7 @@
       "default": "21117",
       "kind": "integer",
       "secret": false,
+      "dynamic": false,
       "restart_required": true,
       "minimum": 1,
       "maximum": 65533
@@ -130,6 +146,7 @@
       "default": "",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -137,6 +154,7 @@
       "default": "",
       "kind": "string",
       "secret": true,
+      "dynamic": false,
       "restart_required": true
     },
     {
@@ -144,7 +162,8 @@
       "default": "0.66",
       "kind": "number",
       "secret": false,
-      "restart_required": true,
+      "dynamic": true,
+      "restart_required": false,
       "minimum": 0.01,
       "maximum": 1
     },
@@ -153,7 +172,8 @@
       "default": "1800",
       "kind": "integer",
       "secret": false,
-      "restart_required": true,
+      "dynamic": true,
+      "restart_required": false,
       "minimum": 1,
       "maximum": 4294967
     },
@@ -162,7 +182,8 @@
       "default": "32",
       "kind": "number",
       "secret": false,
-      "restart_required": true,
+      "dynamic": true,
+      "restart_required": false,
       "minimum": 0.01,
       "maximum": 1000000
     },
@@ -171,7 +192,8 @@
       "default": "1024",
       "kind": "number",
       "secret": false,
-      "restart_required": true,
+      "dynamic": true,
+      "restart_required": false,
       "minimum": 0.01,
       "maximum": 1000000
     },
@@ -180,7 +202,8 @@
       "default": "128",
       "kind": "number",
       "secret": false,
-      "restart_required": true,
+      "dynamic": true,
+      "restart_required": false,
       "minimum": 0.01,
       "maximum": 1000000
     },
@@ -189,6 +212,7 @@
       "default": "info",
       "kind": "string",
       "secret": false,
+      "dynamic": false,
       "restart_required": true
     }
   ]

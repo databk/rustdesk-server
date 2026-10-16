@@ -3,7 +3,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Extension, Path,
+        Extension, Path, Query,
     },
     http::{Request, StatusCode},
     middleware::{self, Next},
@@ -17,9 +17,9 @@ use axum::{
 use hbb_common::{anyhow::anyhow, log, tokio, ResultType};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -37,6 +37,39 @@ static PEERS: Lazy<RwLock<Vec<Value>>> = Lazy::new(|| RwLock::new(Vec::new()));
 static SESSIONS: Lazy<RwLock<HashMap<String, Session>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static BANS: Lazy<RwLock<Bans>> = Lazy::new(|| RwLock::new(Bans::default()));
 static BAN_UPDATES: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static LOGS: Lazy<RwLock<VecDeque<String>>> = Lazy::new(|| RwLock::new(VecDeque::new()));
+
+// Runtime view of the managed configuration. `values` holds the effective
+// running value of every schema entry (secrets stay REDACTED), `overrides`
+// holds the persisted desired values as submitted, and `pending` holds the
+// restart-required entries that differ from the running values.
+#[derive(Clone, Default)]
+struct ManagedState {
+    values: BTreeMap<String, String>,
+    overrides: BTreeMap<String, String>,
+    pending: BTreeMap<String, String>,
+}
+
+static MANAGED: Lazy<RwLock<ManagedState>> = Lazy::new(|| RwLock::new(ManagedState::default()));
+static CONFIG_UPDATES: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+// Applied by the owning binary for entries marked as dynamic in the schema.
+// Returning false falls the entry back to restart-required handling.
+pub type DynamicApplier = Box<dyn Fn(&str, &str) -> bool + Send + Sync>;
+static DYNAMIC_APPLY: Lazy<RwLock<Option<DynamicApplier>>> = Lazy::new(|| RwLock::new(None));
+
+pub fn set_dynamic_apply(applier: DynamicApplier) {
+    *DYNAMIC_APPLY.write().unwrap() = Some(applier);
+}
+
+fn apply_dynamic(name: &str, value: &str) -> bool {
+    DYNAMIC_APPLY
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|applier| applier(name, value))
+        .unwrap_or(false)
+}
 
 // Aggregated event bus backing the /v1/events SSE stream. hbbs emits local
 // events (peers, bans, relays) and forwards the events reported by connected
@@ -77,6 +110,16 @@ static RELAY_SYNC: Lazy<RwLock<Option<RelaySync>>> = Lazy::new(|| RwLock::new(No
 #[allow(dead_code)] // Only the hbbs binary registers a relay sync callback.
 pub fn set_relay_sync(sync: RelaySync) {
     *RELAY_SYNC.write().unwrap() = Some(sync);
+}
+
+// Addresses reported by registered relays (used to merge the live relay list).
+pub fn registered_relay_addresses() -> Vec<String> {
+    RELAYS
+        .read()
+        .unwrap()
+        .values()
+        .filter_map(|relay| relay.address.clone())
+        .collect()
 }
 
 fn sync_relay_list() {
@@ -308,6 +351,33 @@ pub fn schema(service: &str) -> Vec<Value> {
     schema[service].as_array().unwrap().clone()
 }
 
+fn validate_value(definition: &Value, name: &str, value: &str) -> ResultType<()> {
+    if value.len() > 4096 || value.contains('\0') || value == REDACTED {
+        return Err(anyhow!("Invalid value for {name}"));
+    }
+    if definition["kind"] == "integer" || definition["kind"] == "number" {
+        if definition["kind"] == "integer" {
+            // Startup consumers parse integers rather than floating point strings.
+            value.parse::<u64>()?;
+        }
+        let number: f64 = value.parse()?;
+        if !number.is_finite()
+            || number < definition["minimum"].as_f64().unwrap()
+            || number > definition["maximum"].as_f64().unwrap()
+            || (definition["kind"] == "integer" && number.fract() != 0.0)
+        {
+            return Err(anyhow!("Out of range: {name}"));
+        }
+    }
+    if name == "bind" {
+        crate::common::parse_bind_address(value)?;
+    }
+    if name == "always-use-relay" && value != "Y" && value != "N" {
+        return Err(anyhow!("Expected Y or N"));
+    }
+    Ok(())
+}
+
 pub fn load_config(service: &str) -> ResultType<ManagedConfig> {
     let path = data_path(service, "config");
     let config: ManagedConfig = match std::fs::read(&path) {
@@ -321,29 +391,7 @@ pub fn load_config(service: &str) -> ResultType<ManagedConfig> {
             .iter()
             .find(|d| d["name"].as_str() == Some(name.as_str()))
             .ok_or_else(|| anyhow!("Unknown managed configuration: {name}"))?;
-        if value.len() > 4096 || value.contains('\0') || value == REDACTED {
-            return Err(anyhow!("Invalid value for {name}"));
-        }
-        if definition["kind"] == "integer" || definition["kind"] == "number" {
-            if definition["kind"] == "integer" {
-                // Startup consumers parse integers rather than floating point strings.
-                value.parse::<u64>()?;
-            }
-            let number: f64 = value.parse()?;
-            if !number.is_finite()
-                || number < definition["minimum"].as_f64().unwrap()
-                || number > definition["maximum"].as_f64().unwrap()
-                || (definition["kind"] == "integer" && number.fract() != 0.0)
-            {
-                return Err(anyhow!("Out of range: {name}"));
-            }
-        }
-        if name == "bind" {
-            crate::common::parse_bind_address(value)?;
-        }
-        if name == "always-use-relay" && value != "Y" && value != "N" {
-            return Err(anyhow!("Expected Y or N"));
-        }
+        validate_value(definition, name, value)?;
     }
     Ok(config)
 }
@@ -365,7 +413,7 @@ struct ApiState {
     service: &'static str,
     token: String,
     started: Instant,
-    values: BTreeMap<String, String>,
+
 }
 
 async fn authorize(request: Request<Body>, next: Next<Body>) -> Response {
@@ -400,7 +448,193 @@ async fn status(Extension(state): Extension<ApiState>) -> Json<Value> {
 }
 
 async fn config(Extension(state): Extension<ApiState>) -> Json<Value> {
-    Json(json!({"schema":schema(state.service),"values":state.values}))
+    let managed = MANAGED.read().unwrap();
+    let mut pending = Map::new();
+    for (name, value) in &managed.pending {
+        pending.insert(
+            name.clone(),
+            json!({
+                "current": managed.values.get(name).cloned().unwrap_or_default(),
+                "pending": value.clone(),
+            }),
+        );
+    }
+    Json(
+        json!({"schema":schema(state.service),"values":managed.values.clone(),
+        "pending_restart":pending}),
+    )
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigUpdate {
+    values: BTreeMap<String, String>,
+}
+
+fn definition_of(definitions: &[Value], name: &str) -> Option<Value> {
+    definitions
+        .iter()
+        .find(|d| d["name"].as_str() == Some(name))
+        .cloned()
+}
+
+fn bad_request(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": message})),
+    )
+        .into_response()
+}
+
+async fn replace_config(
+    Extension(state): Extension<ApiState>,
+    Json(update): Json<ConfigUpdate>,
+) -> Response {
+    // Validate the submission against the schema before touching any state.
+    let definitions = schema(state.service);
+    for (name, value) in &update.values {
+        let Some(definition) = definition_of(&definitions, name) else {
+            return bad_request(format!("Unknown managed configuration: {name}"));
+        };
+        if definition["secret"] == true && value == REDACTED {
+            continue;
+        }
+        if let Err(err) = validate_value(&definition, name, value) {
+            return bad_request(err.to_string());
+        }
+    }
+    let service = state.service;
+    // The task owns the update through persistence and activation even if the
+    // HTTP caller disconnects while the blocking filesystem work is in flight.
+    let result = tokio::spawn(async move {
+        let _update = CONFIG_UPDATES.lock().await;
+        let (mut values, mut overrides, mut pending) = {
+            let managed = MANAGED.read().unwrap();
+            (
+                managed.values.clone(),
+                managed.overrides.clone(),
+                managed.pending.clone(),
+            )
+        };
+        for (name, value) in &update.values {
+            let Some(definition) = definition_of(&definitions, name) else {
+                continue;
+            };
+            if definition["secret"] == true && value == REDACTED {
+                continue;
+            }
+            overrides.insert(name.clone(), value.clone());
+        }
+        // Persist before activation; a write failure keeps the running state.
+        let persisted = overrides.clone();
+        tokio::task::spawn_blocking(move || persist_config(service, &persisted)).await??;
+        let mut applied = Map::new();
+        let mut pending_report = Map::new();
+        for (name, value) in &overrides {
+            let Some(definition) = definition_of(&definitions, name) else {
+                continue;
+            };
+            let secret = definition["secret"] == true;
+            // Secrets cannot be compared against the running value because the
+            // effective view is redacted; only resubmitted secrets are reported.
+            if secret && !update.values.contains_key(name) {
+                continue;
+            }
+            let display = if secret {
+                REDACTED.to_owned()
+            } else {
+                value.clone()
+            };
+            if !secret && values.get(name) == Some(&display) {
+                pending.remove(name);
+                continue;
+            }
+            if definition["dynamic"] == true && apply_dynamic(name, value) {
+                values.insert(name.clone(), display.clone());
+                pending.remove(name);
+                applied.insert(name.clone(), json!(display));
+            } else {
+                let current = values.get(name).cloned().unwrap_or_default();
+                pending.insert(name.clone(), display.clone());
+                pending_report.insert(
+                    name.clone(),
+                    json!({"current": current, "pending": display}),
+                );
+            }
+        }
+        *MANAGED.write().unwrap() = ManagedState {
+            values,
+            overrides,
+            pending,
+        };
+        Ok::<_, hbb_common::anyhow::Error>((applied, pending_report))
+    })
+    .await;
+    match result {
+        Ok(Ok((applied, pending_report))) => Json(
+            json!({"state":"saved","applied":applied,"pending_restart":pending_report}),
+        )
+        .into_response(),
+        Ok(Err(err)) => {
+            log::error!("Unable to persist managed configuration: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(join) => {
+            log::error!("Managed configuration update task failed: {join}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn persist_config(service: &str, overrides: &BTreeMap<String, String>) -> ResultType<()> {
+    let path = data_path(service, "config");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let temporary = path.with_extension("tmp");
+    let payload = serde_json::to_vec(&ManagedConfig {
+        values: overrides.clone(),
+    })?;
+    std::fs::write(&temporary, payload)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+pub const LOG_CAPACITY: usize = 2000;
+const LOG_LINE_LIMIT: usize = 2048;
+
+// Called from the logging format hook in both binaries so management clients
+// can read recent in-memory log lines without container log access.
+pub fn push_log_line(line: &str) {
+    let mut owned;
+    let line = if line.len() > LOG_LINE_LIMIT {
+        let mut end = LOG_LINE_LIMIT;
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        owned = String::from(&line[..end]);
+        owned.push_str("...");
+        &owned
+    } else {
+        line
+    };
+    let mut logs = LOGS.write().unwrap();
+    if logs.len() >= LOG_CAPACITY {
+        logs.pop_front();
+    }
+    logs.push_back(line.to_owned());
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct LogsQuery {
+    #[serde(default)]
+    tail: Option<usize>,
+}
+
+async fn logs(Query(query): Query<LogsQuery>) -> Response {
+    let tail = query.tail.unwrap_or(200).min(LOG_CAPACITY);
+    let logs = LOGS.read().unwrap();
+    let skipped = logs.len().saturating_sub(tail);
+    let data: Vec<String> = logs.iter().skip(skipped).cloned().collect();
+    Json(json!({"data": data})).into_response()
 }
 
 async fn peers(Extension(state): Extension<ApiState>) -> Response {
@@ -526,6 +760,7 @@ pub fn start(service: &'static str, port: u16) -> ResultType<()> {
             "RD_MANAGEMENT_TOKEN must contain at least 32 characters"
         ));
     }
+    let overrides = load_config(service)?.values;
     let mut values = BTreeMap::new();
     for definition in schema(service) {
         let name = definition["name"].as_str().unwrap();
@@ -545,11 +780,17 @@ pub fn start(service: &'static str, port: u16) -> ResultType<()> {
             },
         );
     }
+    // Restart-required overrides took effect during startup, so nothing is
+    // pending right after boot; dynamic entries were applied by the owner too.
+    *MANAGED.write().unwrap() = ManagedState {
+        values,
+        overrides,
+        pending: BTreeMap::new(),
+    };
     let state = ApiState {
         service,
         token,
         started: Instant::now(),
-        values,
     };
     let router = router(state);
     let listener = std::net::TcpListener::bind(&bind)?;
@@ -819,7 +1060,8 @@ async fn events() -> Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infal
 fn router(state: ApiState) -> Router {
     Router::new()
         .route("/v1/status", get(status))
-        .route("/v1/config", get(config))
+        .route("/v1/config", get(config).put(replace_config))
+        .route("/v1/logs", get(logs))
         .route("/v1/peers", get(peers))
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/:uuid", axum::routing::delete(disconnect))
@@ -896,7 +1138,7 @@ mod tests {
             service: "hbbs",
             token: "test".into(),
             started: Instant::now(),
-            values: BTreeMap::new(),
+
         };
         let a = Bans {
             device_ids: vec!["policy-a".into()],
@@ -964,7 +1206,7 @@ mod tests {
             service: "hbbs",
             token: token.into(),
             started: Instant::now(),
-            values: BTreeMap::new(),
+
         });
         let task = tokio::spawn(
             axum::Server::from_tcp(listener)
@@ -1091,7 +1333,6 @@ mod tests {
             service: "hbbs",
             token: "test".into(),
             started: Instant::now(),
-            values: BTreeMap::new(),
         };
         let response = replace_bans(
             Extension(state),
@@ -1187,5 +1428,238 @@ mod tests {
         });
         assert!(rx.try_recv().is_ok());
         close_session("test-session");
+    }
+
+    struct ConfigFixture {
+        directory: PathBuf,
+        previous_directory: Option<String>,
+        previous_managed: ManagedState,
+        previous_applier: Option<DynamicApplier>,
+    }
+
+    impl ConfigFixture {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "rustdesk-config-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let fixture = Self {
+                directory,
+                previous_directory: std::env::var("RD_MANAGEMENT_DIR").ok(),
+                previous_managed: MANAGED.read().unwrap().clone(),
+                previous_applier: DYNAMIC_APPLY.write().unwrap().take(),
+            };
+            std::env::set_var("RD_MANAGEMENT_DIR", &fixture.directory);
+            std::env::remove_var("RD_MANAGEMENT_BIND");
+            *MANAGED.write().unwrap() = ManagedState::default();
+            fixture
+        }
+
+        fn state(service: &'static str) -> ApiState {
+            ApiState {
+                service,
+                token: "test".into(),
+                started: Instant::now(),
+            }
+        }
+    }
+
+    impl Drop for ConfigFixture {
+        fn drop(&mut self) {
+            *MANAGED.write().unwrap() = self.previous_managed.clone();
+            *DYNAMIC_APPLY.write().unwrap() = self.previous_applier.take();
+            match &self.previous_directory {
+                Some(value) => std::env::set_var("RD_MANAGEMENT_DIR", value),
+                None => std::env::remove_var("RD_MANAGEMENT_DIR"),
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn managed_values(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn put_config_applies_dynamic_entries_and_reports_pending_restart() {
+        let _test = POLICY_TEST.lock().unwrap();
+        let _fixture = ConfigFixture::new();
+        *MANAGED.write().unwrap() = ManagedState {
+            values: managed_values(&[("limit-speed", "32"), ("port", "21117")]),
+            overrides: BTreeMap::new(),
+            pending: BTreeMap::new(),
+        };
+        set_dynamic_apply(Box::new(|name, _| {
+            matches!(name, "limit-speed" | "single-bandwidth")
+        }));
+        let response = replace_config(
+            Extension(ConfigFixture::state("hbbr")),
+            Json(ConfigUpdate {
+                values: managed_values(&[("limit-speed", "64"), ("port", "21118")]),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body["applied"]["limit-speed"], "64");
+        assert_eq!(body["pending_restart"]["port"]["current"], "21117");
+        assert_eq!(body["pending_restart"]["port"]["pending"], "21118");
+        let managed = MANAGED.read().unwrap();
+        assert_eq!(managed.values.get("limit-speed").unwrap(), "64");
+        assert_eq!(managed.values.get("port").unwrap(), "21117");
+        assert_eq!(managed.pending.get("port").unwrap(), "21118");
+        let persisted: ManagedConfig = serde_json::from_slice(
+            &std::fs::read(data_path("hbbr", "config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.values, managed_values(&[("limit-speed", "64"), ("port", "21118")]));
+        // The live config view reflects the dynamic change and the pending entry.
+        let view = config(Extension(ConfigFixture::state("hbbr"))).await;
+        assert_eq!(view["values"]["limit-speed"], "64");
+        assert_eq!(view["values"]["port"], "21117");
+        assert_eq!(view["pending_restart"]["port"]["pending"], "21118");
+    }
+
+    #[tokio::test]
+    async fn put_config_write_failure_does_not_activate() {
+        let _test = POLICY_TEST.lock().unwrap();
+        let fixture = ConfigFixture::new();
+        *MANAGED.write().unwrap() = ManagedState {
+            values: managed_values(&[("limit-speed", "32")]),
+            overrides: BTreeMap::new(),
+            pending: BTreeMap::new(),
+        };
+        set_dynamic_apply(Box::new(|name, _| name == "limit-speed"));
+        // Force the rename to fail; the running values must remain intact.
+        std::fs::create_dir_all(data_path("hbbr", "config").parent().unwrap()).unwrap();
+        std::fs::create_dir(data_path("hbbr", "config")).unwrap();
+        let response = replace_config(
+            Extension(ConfigFixture::state("hbbr")),
+            Json(ConfigUpdate {
+                values: managed_values(&[("limit-speed", "64")]),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            MANAGED.read().unwrap().values.get("limit-speed").unwrap(),
+            "32"
+        );
+        assert!(MANAGED.read().unwrap().pending.is_empty());
+        drop(fixture);
+    }
+
+    #[tokio::test]
+    async fn put_config_rejects_unknown_and_invalid_values() {
+        let _test = POLICY_TEST.lock().unwrap();
+        let _fixture = ConfigFixture::new();
+        let state = ConfigFixture::state("hbbr");
+        let unknown = replace_config(
+            Extension(state.clone()),
+            Json(ConfigUpdate {
+                values: managed_values(&[("unknown-entry", "1")]),
+            }),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        let out_of_range = replace_config(
+            Extension(state.clone()),
+            Json(ConfigUpdate {
+                values: managed_values(&[("limit-speed", "0")]),
+            }),
+        )
+        .await;
+        assert_eq!(out_of_range.status(), StatusCode::BAD_REQUEST);
+        let malformed_bind = replace_config(
+            Extension(state),
+            Json(ConfigUpdate {
+                values: managed_values(&[("bind", "not-an-ip")]),
+            }),
+        )
+        .await;
+        assert_eq!(malformed_bind.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_config_keeps_secret_values_and_redacts_reports() {
+        let _test = POLICY_TEST.lock().unwrap();
+        let _fixture = ConfigFixture::new();
+        *MANAGED.write().unwrap() = ManagedState {
+            values: managed_values(&[("key", REDACTED), ("port", "21117")]),
+            overrides: BTreeMap::new(),
+            pending: BTreeMap::new(),
+        };
+        let response = replace_config(
+            Extension(ConfigFixture::state("hbbr")),
+            Json(ConfigUpdate {
+                values: managed_values(&[("key", "replacement-secret")]),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body["pending_restart"]["key"]["pending"], REDACTED);
+        assert!(!format!("{body:?}").contains("replacement-secret"));
+        let persisted: ManagedConfig = serde_json::from_slice(
+            &std::fs::read(data_path("hbbr", "config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted.values.get("key").unwrap(),
+            "replacement-secret"
+        );
+        // Resubmitting the placeholder keeps the stored secret untouched.
+        let response = replace_config(
+            Extension(ConfigFixture::state("hbbr")),
+            Json(ConfigUpdate {
+                values: managed_values(&[("key", REDACTED), ("port", "21117")]),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let persisted: ManagedConfig = serde_json::from_slice(
+            &std::fs::read(data_path("hbbr", "config")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted.values.get("key").unwrap(),
+            "replacement-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_ring_buffer_captures_tails_and_truncates() {
+        for _ in 0..8 {
+            push_log_line("short line");
+        }
+        let long: String = "x".repeat(LOG_LINE_LIMIT + 100);
+        push_log_line(&long);
+        let response = logs(Query(LogsQuery { tail: Some(3) })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
+                .unwrap();
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 3);
+        assert_eq!(data[0], "short line");
+        assert_eq!(data[1], "short line");
+        let truncated = data[2].as_str().unwrap();
+        assert!(truncated.starts_with('x'));
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() <= LOG_LINE_LIMIT + 3);
+        // Reset the ring for other tests.
+        LOGS.write().unwrap().clear();
     }
 }

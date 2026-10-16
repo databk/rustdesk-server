@@ -51,6 +51,7 @@ pub async fn start_with_bind(bind_addr: Option<IpAddr>, port: &str, key: &str) -
             let console = crate::common::listen_console(bind_addr, port).await?;
             if !management_started {
                 crate::management::start("hbbr", port)?;
+                crate::management::set_dynamic_apply(Box::new(command::apply_dynamic));
                 let control_url = std::env::var("RD_HBBS_API_URL").unwrap_or_default();
                 if !control_url.is_empty() {
                     let token = std::env::var("RD_MANAGEMENT_TOKEN").unwrap_or_default();
