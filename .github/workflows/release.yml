@@ -1,24 +1,33 @@
-name: Build
+name: Release
 
 # ------------- NOTE
+# this workflow is triggered manually and automates the whole release:
+#   1. compute the next version from the conventional commits since the last
+#      release and bump it everywhere (Cargo.toml, Cargo.lock, ui/setup.nsi,
+#      debian/changelog, CHANGELOG.md)
+#   2. generate the changelog, create the release commit and push the tag
+#   3. build all binaries, docker images and debian packages from that commit
+#   4. publish a GitHub release with the generated changelog
+#
 # please setup some secrets before running this workflow:
+# RELEASE_APP_CLIENT_ID is the client id of a GitHub App (contents:write) used
+#   to push the release commit so CI runs on it as well
+# RELEASE_APP_PRIVATE_KEY is the private key of that GitHub App
 # DOCKER_IMAGE should be the target image name on docker hub (e.g. "rustdesk/rustdesk-server-s6" )
 # DOCKER_IMAGE_CLASSIC should be the target image name on docker hub for the old build (e.g. "rustdesk/rustdesk-server" )
 # DOCKERHUB_USERNAME is the username you normally use to login at https://hub.docker.com/
 # DOCKERHUB_TOKEN is a token you should create under "account settings / security" with read/write access
 
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   packages: write
-
-on:
-  workflow_dispatch:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+-[0-9]+'
-      - '[0-9]+.[0-9]+.[0-9]+-[0-9]+'
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,9 +36,65 @@ env:
   GHCR_IMAGE_CLASSIC: ghcr.io/databk/rustdesk-server
 
 jobs:
+  # bump the version, generate the changelog and tag the release commit
+  prepare:
+    name: Pin release version and commit
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.changelog.outputs.version }}
+      skipped: ${{ steps.changelog.outputs.skipped }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      changelog: ${{ steps.changelog.outputs.clean_changelog }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate App Token
+        uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Get GitHub App User ID
+        id: get-user-id
+        run: echo "user-id=$(gh api '/users/${{ steps.app-token.outputs.app-slug }}[bot]' --jq .id)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Generate changelog and bump version
+        id: changelog
+        uses: TriPSs/conventional-changelog-action@v6
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          git-user-name: '${{ steps.app-token.outputs.app-slug }}[bot]'
+          git-user-email: '${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+          tag-prefix: ''
+          version-file: './Cargo.toml'
+          version-path: 'package.version'
+          pre-commit: 'scripts/release/pre-commit.js'
+
+      - name: Verify immutable release identity
+        if: steps.changelog.outputs.skipped == 'false'
+        id: identity
+        env:
+          RELEASE_VERSION: ${{ steps.changelog.outputs.version }}
+        run: |
+          set -eu
+          COMMIT=$(git rev-parse "$RELEASE_VERSION^{commit}")
+          test "$COMMIT" = "$(git rev-parse HEAD)"
+          test "$RELEASE_VERSION" = "$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          echo "source_commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
   # binary build
   build:
     name: Build - ${{ matrix.job.name }}
+    needs: prepare
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,6 +109,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
           submodules: recursive
 
       - name: Install toolchain
@@ -78,11 +144,14 @@ jobs:
 
   build-win:
     name: Build - windows
+    needs: prepare
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
           submodules: recursive
 
       - name: Install toolchain
@@ -165,12 +234,14 @@ jobs:
             ui\SignOutput\RustDeskServer.Setup.exe
           if-no-files-found: error
 
-  # github (draft) release with all binaries
+  # github release with all binaries
   release:
     name: Github release
     needs:
+      - prepare
       - build
       - build-win
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -198,16 +269,23 @@ jobs:
           DEBIAN_FRONTEND=noninteractive sudo apt install -y zip
           zip ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip ${{ matrix.job.name }}/*
 
-      - name: Create Release (${{ matrix.job.os }} - (${{ matrix.job.name }})
+      - name: Upload to Release (${{ matrix.job.os }} - ${{ matrix.job.name }})
         uses: softprops/action-gh-release@v3
         with:
-          draft: true
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }}
+          body: ${{ needs.prepare.outputs.changelog }}
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
           files: ${{ matrix.job.name }}/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}.zip
 
   # docker build and push of single-arch images
   docker:
     name: Docker push - ${{ matrix.job.name }}
-    needs: build
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -221,6 +299,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
           submodules: recursive
 
       - name: Download binaries
@@ -259,13 +338,16 @@ jobs:
         with:
           images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE }}
 
-      - name: Get git tag
-        id: vars
+      - name: Resolve release tags
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          T=${GITHUB_REF#refs/*/}
+          T=$RELEASE_VERSION
           M=${T%%.*}
+          MM=$(echo "$T" | cut -d. -f1-2)
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          echo "MAJOR_MINOR_TAG=$MM" >> $GITHUB_ENV
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
@@ -279,16 +361,21 @@ jobs:
           tags: |
             ${{ secrets.DOCKER_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
             ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-${{ matrix.job.name }}
             ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
             ${{ env.GHCR_IMAGE }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
             ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-${{ matrix.job.name }}
             ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
           labels: ${{ steps.meta.outputs.labels }}
 
   # docker build and push of multiarch images
   docker-manifest:
     name: Docker manifest
-    needs: docker
+    needs:
+      - prepare
+      - docker
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Log in to Docker Hub
@@ -298,13 +385,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get git tag
-        id: vars
+      - name: Resolve release tags
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          T=${GITHUB_REF#refs/*/}
+          T=$RELEASE_VERSION
           M=${T%%.*}
+          MM=$(echo "$T" | cut -d. -f1-2)
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          echo "MAJOR_MINOR_TAG=$MM" >> $GITHUB_ENV
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -315,13 +405,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # manifest for :1.2.3 tag
-      #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@1.0.0
-        if: github.event_name != 'workflow_dispatch'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}-i386
+          push: true
+
+      # manifest for :1.2 tag (major.minor release)
+      - name: Create and push manifest (:major.minor)
+        uses: Noelware/docker-manifest-action@1.0.0
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-armv7,${{ secrets.DOCKER_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-i386
           push: true
 
       # manifest for :1 tag (major release)
@@ -344,10 +440,17 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push GHCR manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@1.0.0
-        if: github.event_name != 'workflow_dispatch'
         with:
           base-image: ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}
           extra-images: ${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.GIT_TAG }}-i386
+          push: true
+
+      # manifest for :1.2 tag (major.minor release)
+      - name: Create and push GHCR manifest (:major.minor)
+        uses: Noelware/docker-manifest-action@1.0.0
+        with:
+          base-image: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-amd64,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-armv7,${{ env.GHCR_IMAGE }}:${{ env.MAJOR_MINOR_TAG }}-i386
           push: true
 
       # manifest for :1 tag (major release)
@@ -369,7 +472,10 @@ jobs:
   # docker build and push of single-arch images
   docker-classic:
     name: Docker push - ${{ matrix.job.name }}
-    needs: build
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -382,6 +488,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
           submodules: recursive
 
       - name: Download binaries
@@ -420,13 +527,16 @@ jobs:
         with:
           images: registry.hub.docker.com/${{ secrets.DOCKER_IMAGE_CLASSIC }}
 
-      - name: Get git tag
-        id: vars
+      - name: Resolve release tags
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          T=${GITHUB_REF#refs/*/}
+          T=$RELEASE_VERSION
           M=${T%%.*}
+          MM=$(echo "$T" | cut -d. -f1-2)
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          echo "MAJOR_MINOR_TAG=$MM" >> $GITHUB_ENV
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
@@ -438,16 +548,21 @@ jobs:
           tags: |
             ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
             ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-${{ matrix.job.name }}
             ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
             ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.LATEST_TAG }}-${{ matrix.job.name }}
             ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-${{ matrix.job.name }}
+            ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-${{ matrix.job.name }}
             ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_TAG }}-${{ matrix.job.name }}
           labels: ${{ steps.meta.outputs.labels }}
 
   # docker build and push of multiarch images
   docker-manifest-classic:
     name: Docker manifest
-    needs: docker
+    needs:
+      - prepare
+      - docker-classic
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Log in to Docker Hub
@@ -457,13 +572,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Get git tag
-        id: vars
+      - name: Resolve release tags
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          T=${GITHUB_REF#refs/*/}
+          T=$RELEASE_VERSION
           M=${T%%.*}
+          MM=$(echo "$T" | cut -d. -f1-2)
           echo "GIT_TAG=$T" >> $GITHUB_ENV
           echo "MAJOR_TAG=$M" >> $GITHUB_ENV
+          echo "MAJOR_MINOR_TAG=$MM" >> $GITHUB_ENV
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -474,13 +592,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # manifest for :1.2.3 tag
-      #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@1.0.0
-        if: github.event_name != 'workflow_dispatch'
         with:
           base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
           extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-armv7
+          push: true
+
+      # manifest for :1.2 tag (major.minor release)
+      - name: Create and push manifest (:major.minor)
+        uses: Noelware/docker-manifest-action@1.0.0
+        with:
+          base-image: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}
+          extra-images: ${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-amd64,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-arm64v8,${{ secrets.DOCKER_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-armv7
           push: true
 
       # manifest for :1 tag (major release)
@@ -503,10 +627,17 @@ jobs:
       # manifest for :1.2.3 tag
       - name: Create and push GHCR manifest (:ve.rs.ion)
         uses: Noelware/docker-manifest-action@1.0.0
-        if: github.event_name != 'workflow_dispatch'
         with:
           base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}
           extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.GIT_TAG }}-armv7
+          push: true
+
+      # manifest for :1.2 tag (major.minor release)
+      - name: Create and push GHCR manifest (:major.minor)
+        uses: Noelware/docker-manifest-action@1.0.0
+        with:
+          base-image: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}
+          extra-images: ${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-amd64,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-arm64v8,${{ env.GHCR_IMAGE_CLASSIC }}:${{ env.MAJOR_MINOR_TAG }}-armv7
           push: true
 
       # manifest for :1 tag (major release)
@@ -527,7 +658,10 @@ jobs:
 
   deb-package:
     name: debian package - ${{ matrix.job.name }}
-    needs: build
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.skipped == 'false'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -541,6 +675,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
           submodules: recursive
 
       - name: Set up QEMU
@@ -566,10 +701,14 @@ jobs:
           cd debian-build/${{ matrix.job.name }}/
           debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
 
-      - name: Create Release
+      - name: Upload to Release
         uses: softprops/action-gh-release@v3
         with:
-          draft: true
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }}
+          body: ${{ needs.prepare.outputs.changelog }}
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
           files: |
             debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
             debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
