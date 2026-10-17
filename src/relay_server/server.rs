@@ -50,8 +50,11 @@ pub async fn start_with_bind(bind_addr: Option<IpAddr>, port: &str, key: &str) -
             let websocket = crate::common::listen_tcp(bind_addr, port2).await?;
             let console = crate::common::listen_console(bind_addr, port).await?;
             if !management_started {
-                crate::management::start("hbbr", port)?;
+                // Register the dynamic applier before the listener starts so
+                // early config updates apply immediately instead of being
+                // reported as pending restart.
                 crate::management::set_dynamic_apply(Box::new(command::apply_dynamic));
+                crate::management::start("hbbr", port)?;
                 management_started = true;
             }
             connection::io_loop(listener, websocket, console, &key).await;
