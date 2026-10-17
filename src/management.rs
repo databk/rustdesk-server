@@ -740,23 +740,6 @@ async fn peers(Extension(state): Extension<ApiState>) -> Response {
     Json(json!({"data":PEERS.read().unwrap().clone()})).into_response()
 }
 
-async fn sessions(Extension(state): Extension<ApiState>) -> Response {
-    if state.service != "hbbr" {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    Json(json!({"data":sessions_snapshot()})).into_response()
-}
-
-async fn disconnect(Extension(state): Extension<ApiState>, Path(uuid): Path<String>) -> Response {
-    if state.service != "hbbr" {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if disconnect_session(&uuid) {
-        return (StatusCode::ACCEPTED, Json(json!({"state":"closing"}))).into_response();
-    }
-    StatusCode::NOT_FOUND.into_response()
-}
-
 async fn bans() -> Json<Bans> {
     Json(BANS.read().unwrap().clone())
 }
@@ -1262,8 +1245,6 @@ fn router(state: ApiState) -> Router {
         .route("/v1/config", get(config).put(replace_config))
         .route("/v1/logs", get(logs))
         .route("/v1/peers", get(peers))
-        .route("/v1/sessions", get(sessions))
-        .route("/v1/sessions/:uuid", axum::routing::delete(disconnect))
         .route("/v1/bans", get(bans).put(replace_bans))
         .route("/v1/restart", axum::routing::post(restart))
         .route("/v1/events", get(events))

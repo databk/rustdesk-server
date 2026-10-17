@@ -55,10 +55,9 @@ pub async fn start_with_bind(bind_addr: Option<IpAddr>, port: &str, key: &str) -
                 // of being reported as pending restart.
                 crate::management::set_dynamic_apply(Box::new(command::apply_dynamic));
                 // The managed state backs the control channel's proxied
-                // configuration requests even when no local listener is
-                // bound, so initialize it unconditionally.
+                // configuration requests; hbbr never exposes a local
+                // management listener and is aggregated through hbbs only.
                 crate::management::init_managed_state("hbbr", port)?;
-                crate::management::start("hbbr", port)?;
                 let control_url = std::env::var("RD_HBBS_API_URL").unwrap_or_default();
                 if !control_url.is_empty() {
                     let token = std::env::var("RD_MANAGEMENT_TOKEN").unwrap_or_default();
