@@ -16,4 +16,4 @@ Files are service-specific: `hbbs-config.json`, `hbbr-config.json`, `hbbs-bans.j
 
 Managed settings override startup inputs. Schema and validation are provided by `management-schema.json`. The API returns key placeholders, never the private key. It exposes only `id_ed25519.pub` as the public key.
 
-`docker-managed/Dockerfile` builds the managed hbbs/hbbr image in CI. The Console repository supplies the node agent, combined Compose deployment, permission enforcement, UI, integration workflow and detailed lifecycle documentation in `docs/server-management.md`. Existing binaries remain compatible with deployments that do not enable management.
+`docker-managed/Dockerfile` builds the managed hbbs/hbbr image in CI. The Console repository supplies the combined Compose deployment, permission enforcement, UI, integration workflow and detailed lifecycle documentation in `docs/server-management.md`. Existing binaries remain compatible with deployments that do not enable management.
