@@ -50,7 +50,20 @@ pub async fn start_with_bind(bind_addr: Option<IpAddr>, port: &str, key: &str) -
             let websocket = crate::common::listen_tcp(bind_addr, port2).await?;
             let console = crate::common::listen_console(bind_addr, port).await?;
             if !management_started {
+                // Register the dynamic applier before serving management
+                // requests so early config updates apply immediately instead
+                // of being reported as pending restart.
+                crate::management::set_dynamic_apply(Box::new(command::apply_dynamic));
+                // The managed state backs the control channel's proxied
+                // configuration requests even when no local listener is
+                // bound, so initialize it unconditionally.
+                crate::management::init_managed_state("hbbr", port)?;
                 crate::management::start("hbbr", port)?;
+                let control_url = std::env::var("RD_HBBS_API_URL").unwrap_or_default();
+                if !control_url.is_empty() {
+                    let token = std::env::var("RD_MANAGEMENT_TOKEN").unwrap_or_default();
+                    crate::relay_control::start(&control_url, &token)?;
+                }
                 management_started = true;
             }
             connection::io_loop(listener, websocket, console, &key).await;

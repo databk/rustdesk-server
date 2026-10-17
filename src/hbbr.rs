@@ -1,6 +1,7 @@
 use clap::App;
 mod common;
 mod management;
+mod relay_control;
 mod relay_server;
 use flexi_logger::*;
 use hbb_common::{config::RELAY_PORT, ResultType};
@@ -13,7 +14,7 @@ fn main() -> ResultType<()> {
     managed.apply();
     let _logger = Logger::try_with_env_or_str("info")?
         .log_to_stdout()
-        .format(opt_format)
+        .format(common::log_format)
         .write_mode(WriteMode::Async)
         .start()?;
     let args = format!(

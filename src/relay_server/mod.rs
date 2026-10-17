@@ -4,6 +4,7 @@ mod helper;
 mod server;
 mod stream;
 
+use async_speed_limit::Limiter;
 use hbb_common::tokio::sync::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
@@ -19,6 +20,9 @@ lazy_static::lazy_static! {
     pub(crate) static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     pub(crate) static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     pub(crate) static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
+    // The active shared limiter for TOTAL_BANDWIDTH, refreshed per accept loop
+    // so management updates can adjust the live limiter without restarts.
+    pub(crate) static ref TOTAL_LIMITER: std::sync::RwLock<Option<Limiter>> = Default::default();
 }
 
 pub(crate) static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66

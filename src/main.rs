@@ -13,7 +13,7 @@ fn main() -> ResultType<()> {
     managed.apply();
     let _logger = Logger::try_with_env_or_str("info")?
         .log_to_stdout()
-        .format(opt_format)
+        .format(log_format)
         .write_mode(WriteMode::Async)
         .start()?;
     let args = format!(

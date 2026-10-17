@@ -11,6 +11,20 @@ use std::{
     time::{Instant, SystemTime},
 };
 
+// Mirrors the standard opt_format output while retaining a bounded in-memory
+// copy so the management API can serve recent log lines without any container
+// log access.
+pub fn log_format(
+    w: &mut dyn std::io::Write,
+    now: &mut flexi_logger::DeferredNow,
+    record: &log::Record,
+) -> Result<(), std::io::Error> {
+    let mut buffer = Vec::new();
+    flexi_logger::opt_format(&mut buffer, now, record)?;
+    crate::management::push_log_line(&String::from_utf8_lossy(&buffer));
+    w.write_all(&buffer)
+}
+
 pub fn parse_bind_address(value: &str) -> Result<Option<IpAddr>> {
     let value = value.trim();
     if value.is_empty() {

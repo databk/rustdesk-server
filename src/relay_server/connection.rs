@@ -27,6 +27,9 @@ pub(crate) async fn io_loop(
 ) {
     command::check_params();
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+    // Publish the live limiter so dynamic total-bandwidth updates reach the
+    // running accept loop (clones share the same underlying budget).
+    *TOTAL_LIMITER.write().unwrap() = Some(limiter.clone());
     loop {
         tokio::select! {
             res = listener.accept() => {
