@@ -1,35 +1,103 @@
-# RustDesk Server Program
+# RustDesk Server
 
-[![build](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml)
+Self-host the server side of [RustDesk](https://rustdesk.com), the open source remote desktop software. Run it on your own infrastructure so devices register, find each other, and relay traffic through machines you control.
 
-[**Download**](https://github.com/rustdesk/rustdesk-server/releases)
+This repository is a friendly fork of the official [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server). It stays compatible with stock RustDesk clients while adding a management API for operating servers at scale (see [What this fork adds](#what-this-fork-adds)).
 
-[**Manual**](https://rustdesk.com/docs/en/self-host/)
+## What's inside
 
-[**FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
+A single Rust codebase produces three executables:
 
-[**How to migrate OSS to Pro**](https://rustdesk.com/docs/en/self-host/rustdesk-server-pro/installscript/#convert-from-open-source)
+| Binary | Role |
+| --- | --- |
+| `hbbs` | ID/rendezvous server — registers devices and helps them connect |
+| `hbbr` | Relay server — carries remote desktop traffic when direct connection is not possible |
+| `rustdesk-utils` | Command line utilities for server administration |
 
-Self-host your own RustDesk server, it is free and open source.
+The `ui` folder also contains an optional desktop app that runs the servers as Windows services.
 
-## How to build manually
+## Quick start with Docker Compose
+
+The fastest way to get running:
+
+```yaml
+services:
+  hbbs:
+    image: databk/rustdesk-server:latest
+    container_name: hbbs
+    ports:
+      - 21115:21115
+      - 21116:21116
+      - 21116:21116/udp
+      - 21118:21118
+    command: hbbs -r <your-relay-server>:21117
+    volumes:
+      - ./data:/root
+    restart: unless-stopped
+
+  hbbr:
+    image: databk/rustdesk-server:latest
+    container_name: hbbr
+    ports:
+      - 21117:21117
+      - 21119:21119
+    command: hbbr
+    volumes:
+      - ./data:/root
+    restart: unless-stopped
+```
+
+Start it with `docker compose up -d`, then point your RustDesk clients at `<your-server-host>` (ID server) and `<your-relay-server>:21117` (relay server). The public key your clients need is in `./data/id_ed25519.pub` after first start.
+
+### Ports
+
+| Port | Protocol | Used by | Purpose |
+| --- | --- | --- | --- |
+| 21115 | TCP | hbbs | NAT type test |
+| 21116 | TCP/UDP | hbbs | ID registration and hole punching |
+| 21117 | TCP | hbbr | Relay traffic |
+| 21118 | TCP | hbbs | Web client |
+| 21119 | TCP | hbbr | Web client relay |
+
+## What this fork adds
+
+- **Management REST API** — hbbs serves an opt-in `/v1` API for status, configuration, logs, peer lists, IP/device bans, sessions and live events (SSE), secured by a bearer token.
+- **Relay fleet control** — run several hbbr instances; each one registers with hbbs over a control channel, so you can watch sessions, update settings, or restart any relay through a single API.
+- **Live configuration** — change speed limits, bandwidth caps and the relay list without restarting the servers.
+- **WebRTC signaling** — WebRTC session descriptions and candidates can be exchanged through the rendezvous server.
+
+To enable the management API, set `RD_MANAGEMENT_BIND`, `RD_MANAGEMENT_TOKEN` and `RD_MANAGEMENT_DIR` on hbbs, and `RD_HBBS_API_URL` on each hbbr. Keep the listener on a private network — it is meant for operators, not clients. The full contract is documented in [docs/management.md](docs/management.md), and a companion web console is available in the [rustdesk-console](https://github.com/databk/rustdesk-console) repository.
+
+Everything works without these settings too: with management disabled, the servers behave like the upstream open source release.
+
+## Build from source
+
+Requires a recent Rust toolchain.
 
 ```bash
+git clone --recurse-submodules https://github.com/databk/rustdesk-server.git
+cd rustdesk-server
 cargo build --release
 ```
 
-Three executables will be generated in target/release.
+The binaries appear in `target/release`. To build the optional Windows desktop app, build the `ui` workspace separately.
 
-- hbbs - RustDesk ID/Rendezvous server
-- hbbr - RustDesk relay server
-- rustdesk-utils - RustDesk CLI utilities
+## Other ways to deploy
 
-You can find updated binaries on the [Releases](https://github.com/rustdesk/rustdesk-server/releases) page.
+- **Plain binaries** — download from [Releases](https://github.com/databk/rustdesk-server/releases) or build your own, then run `hbbs` and `hbbr` directly.
+- **Docker** — ready-made images and health checks under `docker/`; a minimal legacy variant under `docker-classic/`.
+- **Kubernetes** — a sample manifest in `kubernetes/example.yaml`.
+- **systemd** — service units for hbbs and hbbr in `systemd/`.
+- **Debian package** — packaging files under `debian/`.
 
-If you want extra features, [RustDesk Server Pro](https://rustdesk.com/pricing.html) might suit you better.
+## Documentation and support
 
-If you want to develop your own server, [rustdesk-server-demo](https://github.com/rustdesk/rustdesk-server-demo) might be a better and simpler start for you than this repo.
+- [RustDesk self-host guide](https://rustdesk.com/docs/en/self-host/) — installation, DNS, and client setup
+- [Management API reference](docs/management.md) — endpoints, configuration and relay control
+- [RustDesk FAQ](https://github.com/rustdesk/rustdesk/wiki/FAQ)
+- [Upstream repository](https://github.com/rustdesk/rustdesk-server) — the base project this fork tracks
+- [RustDesk Server Pro](https://rustdesk.com/pricing.html) — the commercial edition if you need more features
 
-## Installation
+## License
 
-Please follow this [doc](https://rustdesk.com/docs/en/self-host/rustdesk-server-oss/)
+Licensed under [AGPL-3.0](LICENSE), same as the upstream project.
