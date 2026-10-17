@@ -1,8 +1,8 @@
 # RustDesk Server
 
-Self-host the server side of [RustDesk](https://rustdesk.com), the open source remote desktop software. Run it on your own infrastructure so devices register, find each other, and relay traffic through machines you control.
+Self-host the server side of RustDesk, the open source remote desktop software. Run it on your own infrastructure so devices register, find each other, and relay traffic through machines you control.
 
-This repository is a friendly fork of the official [rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server). It stays compatible with stock RustDesk clients while adding a management API for operating servers at scale (see [What this fork adds](#what-this-fork-adds)).
+Standard RustDesk clients connect out of the box, and an optional management API adds centralized configuration, monitoring and relay fleet control for operating servers at scale (see [Highlights](#highlights)).
 
 ## What's inside
 
@@ -59,7 +59,7 @@ Start it with `docker compose up -d`, then point your RustDesk clients at `<your
 | 21118 | TCP | hbbs | Web client |
 | 21119 | TCP | hbbr | Web client relay |
 
-## What this fork adds
+## Highlights
 
 - **Management REST API** — hbbs serves an opt-in `/v1` API for status, configuration, logs, peer lists, IP/device bans, sessions and live events (SSE), secured by a bearer token.
 - **Relay fleet control** — run several hbbr instances; each one registers with hbbs over a control channel, so you can watch sessions, update settings, or restart any relay through a single API.
@@ -68,7 +68,7 @@ Start it with `docker compose up -d`, then point your RustDesk clients at `<your
 
 To enable the management API, set `RD_MANAGEMENT_BIND`, `RD_MANAGEMENT_TOKEN` and `RD_MANAGEMENT_DIR` on hbbs, and `RD_HBBS_API_URL` on each hbbr. Keep the listener on a private network — it is meant for operators, not clients. The full contract is documented in [docs/management.md](docs/management.md), and a companion web console is available in the [rustdesk-console](https://github.com/databk/rustdesk-console) repository.
 
-Everything works without these settings too: with management disabled, the servers behave like the upstream open source release.
+Everything works without these settings too: with management disabled, the servers run a minimal, protocol-only setup.
 
 ## Build from source
 
@@ -90,14 +90,11 @@ The binaries appear in `target/release`. To build the optional Windows desktop a
 - **systemd** — service units for hbbs and hbbr in `systemd/`.
 - **Debian package** — packaging files under `debian/`.
 
-## Documentation and support
+## Documentation
 
-- [RustDesk self-host guide](https://rustdesk.com/docs/en/self-host/) — installation, DNS, and client setup
 - [Management API reference](docs/management.md) — endpoints, configuration and relay control
-- [RustDesk FAQ](https://github.com/rustdesk/rustdesk/wiki/FAQ)
-- [Upstream repository](https://github.com/rustdesk/rustdesk-server) — the base project this fork tracks
-- [RustDesk Server Pro](https://rustdesk.com/pricing.html) — the commercial edition if you need more features
+- [rustdesk-console](https://github.com/databk/rustdesk-console) — companion web console for the management API
 
 ## License
 
-Licensed under [AGPL-3.0](LICENSE), same as the upstream project.
+Licensed under [AGPL-3.0](LICENSE).
