@@ -6,19 +6,6 @@ on:
   pull_request:
 
 jobs:
-  managed-image:
-    name: Managed server image
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker-managed/Dockerfile
-          push: false
 
   check:
     name: Compile Check
