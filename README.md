@@ -18,7 +18,7 @@ The `ui` folder also contains an optional desktop app that runs the servers as W
 
 ## Quick start with Docker Compose
 
-The fastest way to get running is the compose file shipped in this repository, so your deployment tracks the versioned configuration instead of a snippet copied from the docs:
+The fastest way to get running:
 
 ```bash
 curl -LO https://raw.githubusercontent.com/databk/rustdesk-server/master/docker-compose.yml
