@@ -6,6 +6,7 @@
 //! outbound-only so hbbr never exposes a management listener for aggregation.
 use crate::management;
 use hbb_common::futures_util::{sink::SinkExt as _, stream::StreamExt as _};
+use hbb_common::tokio::sync::mpsc;
 use hbb_common::{anyhow::anyhow, log, tokio, ResultType};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -28,9 +29,20 @@ pub fn start(url: &str, token: &str) -> ResultType<()> {
     let token = token.to_owned();
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
+        // The receiver is taken once for the whole task: run() must not take
+        // it again on reconnects, or every later connection would lose the
+        // session event feed.
+        let mut events = management::take_control_receiver();
         loop {
-            match run(&url, &token).await {
-                Ok(()) => log::info!("hbbs control channel closed; reconnecting"),
+            match run(&url, &token, &mut events).await {
+                Ok(registered) => {
+                    if registered {
+                        // A healthy connection just ended; retry promptly
+                        // instead of keeping the accumulated backoff.
+                        backoff = Duration::from_secs(1);
+                    }
+                    log::info!("hbbs control channel closed; reconnecting")
+                }
                 Err(err) => log::warn!("hbbs control channel failed: {err}; reconnecting"),
             }
             tokio::time::sleep(backoff).await;
@@ -40,7 +52,11 @@ pub fn start(url: &str, token: &str) -> ResultType<()> {
     Ok(())
 }
 
-fn relay_identity() -> (String, String) {
+// The relay id identifies the node; the advertised address is optional.
+// Without RD_RELAY_ADDRESS no address is reported: the id (often a container
+// hostname) is not resolvable by clients and must not be broadcast as a relay
+// server address.
+fn relay_identity() -> (String, Option<String>) {
     let id = std::env::var("RD_RELAY_ID")
         .ok()
         .filter(|value| !value.is_empty())
@@ -52,12 +68,17 @@ fn relay_identity() -> (String, String) {
         .unwrap_or_else(|| "hbbr".to_owned());
     let address = std::env::var("RD_RELAY_ADDRESS")
         .ok()
-        .and_then(|value| (!value.is_empty()).then_some(value))
-        .unwrap_or_else(|| id.clone());
+        .and_then(|value| (!value.is_empty()).then_some(value));
     (id, address)
 }
 
-async fn run(url: &str, token: &str) -> ResultType<()> {
+// Returns Ok(true) when the connection had registered successfully before it
+// ended, which lets the caller reset its reconnect backoff.
+async fn run(
+    url: &str,
+    token: &str,
+    events: &mut Option<mpsc::UnboundedReceiver<Value>>,
+) -> ResultType<bool> {
     let mut request = url.into_client_request()?;
     request.headers_mut().insert(
         "authorization",
@@ -65,20 +86,30 @@ async fn run(url: &str, token: &str) -> ResultType<()> {
     );
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await?;
     let (id, address) = relay_identity();
-    let register = json!({
+    let mut register = json!({
         "type": "register",
         "relay": {
             "id": id,
-            "address": address,
             "version": crate::version::VERSION,
         }
     });
+    if let Some(address) = &address {
+        register["relay"]["address"] = json!(address);
+    }
     socket.send(Message::Text(register.to_string())).await?;
-    let mut events = management::take_control_receiver();
+    log::info!("Registered on the hbbs control channel as {id}");
+    // Any outcome from here happened after a successful registration, so the
+    // caller resets its backoff even when the loop below fails.
+    run_registered(&mut socket, events).await.map(|_| true)
+}
+
+async fn run_registered(
+    socket: &mut ControlSocket,
+    events: &mut Option<mpsc::UnboundedReceiver<Value>>,
+) -> ResultType<()> {
     let started = Instant::now();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    log::info!("Registered on the hbbs control channel as {id}");
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -96,7 +127,7 @@ async fn run(url: &str, token: &str) -> ResultType<()> {
             } => {
                 let Some(event) = event else {
                     // The management module dropped its sender; nothing more to forward.
-                    events = None;
+                    *events = None;
                     continue;
                 };
                 socket
@@ -117,7 +148,7 @@ async fn run(url: &str, token: &str) -> ResultType<()> {
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(err) = handle_command(&text, &mut socket).await {
+                        if let Err(err) = handle_command(&text, socket).await {
                             log::warn!("hbbs control command failed: {err}");
                         }
                     }

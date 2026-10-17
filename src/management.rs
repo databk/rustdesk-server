@@ -206,8 +206,9 @@ fn cancel_relay_requests(relay_id: &str) {
 }
 
 // Outbound relay-side events (session lifecycle) consumed by the hbbr control
-// client. Only meaningful inside the hbbr binary; sends without a consumer
-// are dropped.
+// client. Only meaningful inside the hbbr binary. Events are enqueued only
+// after a consumer has taken the receiver, so a relay without the control
+// channel does not accumulate session events forever.
 static CONTROL_OUT: Lazy<(
     mpsc::UnboundedSender<Value>,
     std::sync::Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
@@ -215,13 +216,20 @@ static CONTROL_OUT: Lazy<(
     let (tx, rx) = mpsc::unbounded_channel();
     (tx, std::sync::Mutex::new(Some(rx)))
 });
+static CONTROL_CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn control_emit(event: Value) {
-    let _ = CONTROL_OUT.0.send(event);
+    if CONTROL_CONSUMED.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = CONTROL_OUT.0.send(event);
+    }
 }
 
 pub fn take_control_receiver() -> Option<mpsc::UnboundedReceiver<Value>> {
-    CONTROL_OUT.1.lock().unwrap().take()
+    let receiver = CONTROL_OUT.1.lock().unwrap().take();
+    if receiver.is_some() {
+        CONTROL_CONSUMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    receiver
 }
 
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -837,17 +845,11 @@ pub fn restore_bans(service: &str) -> ResultType<()> {
     Ok(())
 }
 
-pub fn start(service: &'static str, port: u16) -> ResultType<()> {
-    let bind = std::env::var("RD_MANAGEMENT_BIND").unwrap_or_default();
-    if bind.is_empty() {
-        return Ok(());
-    }
-    let token = std::env::var("RD_MANAGEMENT_TOKEN").unwrap_or_default();
-    if token.len() < 32 {
-        return Err(anyhow!(
-            "RD_MANAGEMENT_TOKEN must contain at least 32 characters"
-        ));
-    }
+// Populates the managed state from the schema, deployment arguments and saved
+// overrides. Runs during startup for both services: the HTTP listener is
+// optional, but the control channel and its proxied management requests need
+// the state regardless.
+pub fn init_managed_state(service: &'static str, port: u16) -> ResultType<()> {
     let overrides = load_config(service)?.values;
     let mut values = BTreeMap::new();
     for definition in schema(service) {
@@ -875,6 +877,21 @@ pub fn start(service: &'static str, port: u16) -> ResultType<()> {
         overrides,
         pending: BTreeMap::new(),
     };
+    Ok(())
+}
+
+pub fn start(service: &'static str, port: u16) -> ResultType<()> {
+    init_managed_state(service, port)?;
+    let bind = std::env::var("RD_MANAGEMENT_BIND").unwrap_or_default();
+    if bind.is_empty() {
+        return Ok(());
+    }
+    let token = std::env::var("RD_MANAGEMENT_TOKEN").unwrap_or_default();
+    if token.len() < 32 {
+        return Err(anyhow!(
+            "RD_MANAGEMENT_TOKEN must contain at least 32 characters"
+        ));
+    }
     let state = ApiState {
         service,
         token,
@@ -1009,6 +1026,9 @@ async fn control_socket(mut socket: WebSocket) {
             }
         }
     }
+    // Drop the write guard before sync_relay_list(): it re-acquires RELAYS
+    // for reading, which deadlocks while the write lock is held.
+    let mut left = false;
     {
         let mut relays = RELAYS.write().unwrap();
         if relays
@@ -1019,10 +1039,13 @@ async fn control_socket(mut socket: WebSocket) {
             relays.remove(&relay_id);
             log::info!("Relay {relay_id} left the control channel");
             emit_event("relay_disconnected", json!({"id": relay_id}));
-            sync_relay_list();
             // Pending exchanges die with the connection; waiters fail fast.
             cancel_relay_requests(&relay_id);
+            left = true;
         }
+    }
+    if left {
+        sync_relay_list();
     }
 }
 
@@ -1542,7 +1565,29 @@ mod tests {
     }
 
     #[test]
+    fn control_events_are_enqueued_only_after_a_consumer_takes_the_receiver() {
+        let _test = POLICY_TEST.lock().unwrap();
+        // Events emitted before any consumer registered are dropped instead
+        // of piling up in the unbounded channel.
+        control_emit(json!({"type": "event", "dropped": 1}));
+        let mut receiver = take_control_receiver().expect("first take returns the receiver");
+        assert!(
+            receiver.try_recv().is_err(),
+            "events without a consumer must be dropped"
+        );
+        control_emit(json!({"type": "event", "kept": 2}));
+        assert_eq!(receiver.try_recv().unwrap()["kept"], 2);
+        assert!(
+            take_control_receiver().is_none(),
+            "the receiver is handed out exactly once"
+        );
+        control_emit(json!({"type": "event", "kept": 3}));
+        assert_eq!(receiver.try_recv().unwrap()["kept"], 3);
+    }
+
+    #[test]
     fn control_messages_update_heartbeat_sessions_and_forward_events() {
+        let _test = POLICY_TEST.lock().unwrap();
         clear_relays();
         let generation = RELAY_GENERATION.fetch_add(1, Ordering::SeqCst);
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1588,9 +1633,21 @@ mod tests {
             generation,
             r#"{"type":"event","event":{"kind":"session_opened","session":{"uuid":"session-1"}}}"#,
         );
-        let event = events.try_recv().expect("relay events join the event bus");
+        // The event bus is shared; wait for our own event instead of
+        // assuming it is the next one on the channel.
+        let mut event = None;
+        for _ in 0..100 {
+            match events.try_recv() {
+                Ok(candidate) if candidate["data"]["relay_id"] == "relay-b" => {
+                    event = Some(candidate);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let event = event.expect("relay events join the event bus");
         assert_eq!(event["kind"], "session_opened");
-        assert_eq!(event["data"]["relay_id"], "relay-b");
         clear_relays();
     }
 
