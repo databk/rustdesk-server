@@ -201,11 +201,19 @@ impl PeerMap {
     // rejected with UUID_MISMATCH.
     #[inline]
     pub(crate) async fn release(&self, id: &str) -> ResultType<bool> {
+        // Hold the write lock across the database delete. Dropping it after
+        // the map removal lets a concurrent `get` read the row before the
+        // delete completes and re-insert the retired peer, silently undoing
+        // the release. The lock is global to the map, so unrelated ids
+        // stall for the duration of one primary-key delete — an acceptable
+        // cost for a rare management operation.
+        let mut map = self.map.write().await;
         // A release happened when either the in-memory entry or the
         // persisted row existed; the response must not report "nothing
         // released" for an id that only had a live map entry.
-        let removed = self.map.write().await.remove(id).is_some();
+        let removed = map.remove(id).is_some();
         let deleted = self.db.delete_peer(id).await? > 0;
+        drop(map);
         Ok(removed || deleted)
     }
 
