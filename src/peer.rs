@@ -135,9 +135,13 @@ impl PeerMap {
 
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
-        let p = self.map.read().await.get(id).cloned();
-        if p.is_some() {
-            return p;
+        // Hold the write lock across the database read: `release` removes
+        // the map entry and deletes the row under the same lock, so a
+        // lookup that misses the map can never read the row before the
+        // delete and re-insert the retired peer afterwards.
+        let mut w = self.map.write().await;
+        if let Some(p) = w.get(id) {
+            return Some(p.clone());
         } else if let Ok(Some(v)) = self.db.get_peer(id).await {
             let peer = Peer {
                 guid: v.guid,
@@ -149,7 +153,7 @@ impl PeerMap {
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));
-            self.map.write().await.insert(id.to_owned(), peer.clone());
+            w.insert(id.to_owned(), peer.clone());
             return Some(peer);
         }
         None
@@ -197,8 +201,12 @@ impl PeerMap {
     // rejected with UUID_MISMATCH.
     #[inline]
     pub(crate) async fn release(&self, id: &str) -> ResultType<bool> {
-        self.map.write().await.remove(id);
-        Ok(self.db.delete_peer(id).await? > 0)
+        // A release happened when either the in-memory entry or the
+        // persisted row existed; the response must not report "nothing
+        // released" for an id that only had a live map entry.
+        let removed = self.map.write().await.remove(id).is_some();
+        let deleted = self.db.delete_peer(id).await? > 0;
+        Ok(removed || deleted)
     }
 
     #[inline]
@@ -259,6 +267,11 @@ mod tests {
         // Releasing the id drops both the in-memory entry and the row.
         assert!(pm.release("host-a").await.unwrap());
         assert!(pm.get("host-a").await.is_none());
+        // An id with only a live in-memory entry (no persisted row) also
+        // reports a release.
+        let peer = pm.get_or("host-b").await;
+        peer.write().await.uuid = Bytes::from(vec![5, 5]);
+        assert!(pm.release("host-b").await.unwrap());
         // The replacement machine (a different uuid) can claim the id now.
         assert_eq!(
             register([2, 2], &pm).await,
