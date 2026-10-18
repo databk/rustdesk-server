@@ -76,22 +76,20 @@ impl RendezvousServer {
                     if peer.info.ip != ip && peer.pk != pk {
                         log::warn!(
                             "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                            id, ip, pk, peer.info.ip, peer.pk,
+                            id,
+                            ip,
+                            pk,
+                            peer.info.ip,
+                            peer.pk,
                         );
                         return Err(Self::make_register_pk_response(UUID_MISMATCH));
                     }
                 } else {
-                    log::warn!(
-                        "Peer {} uuid mismatch: {:?} vs {:?}",
-                        id, uuid, peer.uuid
-                    );
+                    log::warn!("Peer {} uuid mismatch: {:?} vs {:?}", id, uuid, peer.uuid);
                     return Err(Self::make_register_pk_response(UUID_MISMATCH));
                 }
                 let ip_changed = peer.info.ip != ip;
-                (
-                    peer.uuid != uuid || peer.pk != pk || ip_changed,
-                    ip_changed,
-                )
+                (peer.uuid != uuid || peer.pk != pk || ip_changed, ip_changed)
             }
         };
         let mut req_pk = peer.read().await.reg_pk;

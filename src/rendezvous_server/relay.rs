@@ -1,15 +1,8 @@
 use super::*;
 use crate::common::*;
-use hbb_common::{
-    config,
-    futures::future::join_all,
-    log,
-
-    tcp::FramedStream,
-    tokio::sync::Mutex,
-};
-use std::sync::Arc;
+use hbb_common::{config, futures::future::join_all, log, tcp::FramedStream, tokio::sync::Mutex};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 impl RendezvousServer {
     pub(crate) fn parse_relay_servers(&mut self, relay_servers: &str) {

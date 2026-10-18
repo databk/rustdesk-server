@@ -3,8 +3,7 @@ use crate::common::*;
 use hbb_common::{
     bail,
     bytes::Bytes,
-    config,
-    log,
+    config, log,
     protobuf::Message as _,
     rendezvous_proto::*,
     tokio::{

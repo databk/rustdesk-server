@@ -32,7 +32,6 @@ use std::{
     time::Instant,
 };
 
-
 pub(crate) const REG_TIMEOUT: i64 = 30_000;
 pub(crate) const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 pub(crate) const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
@@ -119,7 +118,9 @@ mod tests {
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {
         let bind_addr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        let socket = helper::create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
+        let socket = helper::create_udp_listener(Some(bind_addr), 0, 0)
+            .await
+            .unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
     }
 }
