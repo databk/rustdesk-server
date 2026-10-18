@@ -190,6 +190,17 @@ impl PeerMap {
         snapshot
     }
 
+    // Releases a device id entirely: forgets the in-memory entry and deletes
+    // the persisted row, so a replacement machine (a different uuid) can
+    // claim the id again. Custom ids such as hostnames would otherwise stay
+    // bound to the retired machine and every later registration would be
+    // rejected with UUID_MISMATCH.
+    #[inline]
+    pub(crate) async fn release(&self, id: &str) -> ResultType<bool> {
+        self.map.write().await.remove(id);
+        Ok(self.db.delete_peer(id).await? > 0)
+    }
+
     #[inline]
     pub(crate) async fn get_in_memory(&self, id: &str) -> Option<LockPeer> {
         self.map.read().await.get(id).cloned()
@@ -199,5 +210,63 @@ impl PeerMap {
     #[allow(dead_code)]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::rendezvous_proto::register_pk_response;
+    use hbb_common::tokio;
+
+    #[tokio::test]
+    async fn release_forgets_the_id_for_a_replacement_machine() {
+        let path = std::env::temp_dir().join(format!(
+            "rustdesk-peer-release-{}-{:?}.sqlite3",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        crate::common::set_arg("DB_URL", path.to_str().unwrap());
+        let pm = PeerMap::new().await.unwrap();
+        let register = |uuid: [u8; 2], pm: &PeerMap| {
+            let mut pm = pm.clone();
+            async move {
+                let peer = pm.get_or("host-a").await;
+                pm.update_pk(
+                    "host-a".to_owned(),
+                    peer,
+                    "127.0.0.1:1".parse().unwrap(),
+                    Bytes::from(uuid.to_vec()),
+                    Bytes::from(vec![9]),
+                    "127.0.0.1".to_owned(),
+                )
+                .await
+            }
+        };
+        // Note: the uuid-mismatch rejection itself lives in
+        // validate_register_pk on the server; this test covers the registry
+        // state that makes it reject (and stops rejecting after release).
+        assert_eq!(
+            register([1, 1], &pm).await,
+            register_pk_response::Result::OK
+        );
+        let registered = pm.get("host-a").await.unwrap();
+        assert_eq!(
+            registered.read().await.uuid,
+            Bytes::from(vec![1, 1]),
+            "the id is bound to the first machine's uuid"
+        );
+        // Releasing the id drops both the in-memory entry and the row.
+        assert!(pm.release("host-a").await.unwrap());
+        assert!(pm.get("host-a").await.is_none());
+        // The replacement machine (a different uuid) can claim the id now.
+        assert_eq!(
+            register([2, 2], &pm).await,
+            register_pk_response::Result::OK
+        );
+        let registered = pm.get("host-a").await.unwrap();
+        assert_eq!(registered.read().await.uuid, Bytes::from(vec![2, 2]));
+        drop(pm);
+        let _ = std::fs::remove_file(&path);
     }
 }

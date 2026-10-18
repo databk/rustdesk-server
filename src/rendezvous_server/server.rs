@@ -2,8 +2,7 @@ use super::*;
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
-    allow_err,
-    log,
+    allow_err, log,
     tokio::{
         self,
         net::TcpListener,
@@ -79,6 +78,12 @@ impl RendezvousServer {
             .unwrap_or(false)
         {
             let peers = rs.pm.clone();
+            let releaser_peers = rs.pm.clone();
+            crate::management::set_peer_releaser(std::sync::Arc::new(move |id: &str| {
+                let pm = releaser_peers.clone();
+                let id = id.to_owned();
+                Box::pin(async move { pm.release(&id).await })
+            }));
             tokio::spawn(async move {
                 let mut timer = interval(Duration::from_secs(2));
                 loop {
@@ -97,31 +102,28 @@ impl RendezvousServer {
         // registered relays).
         {
             let tx = rs.tx.clone();
-            let static_relays = std::sync::Arc::new(std::sync::Mutex::new(get_arg(
-                "relay-servers",
-            )));
+            let static_relays =
+                std::sync::Arc::new(std::sync::Mutex::new(get_arg("relay-servers")));
             let dynamic_base = static_relays.clone();
             let dynamic_tx = tx.clone();
-            crate::management::set_dynamic_apply(Box::new(
-                move |name, value| match name {
-                    "always-use-relay" => {
-                        let enabled = value.eq_ignore_ascii_case("Y");
-                        ALWAYS_USE_RELAY.store(enabled, std::sync::atomic::Ordering::SeqCst);
-                        true
+            crate::management::set_dynamic_apply(Box::new(move |name, value| match name {
+                "always-use-relay" => {
+                    let enabled = value.eq_ignore_ascii_case("Y");
+                    ALWAYS_USE_RELAY.store(enabled, std::sync::atomic::Ordering::SeqCst);
+                    true
+                }
+                "relay-servers" => {
+                    // Dynamic updates replace the static baseline and are
+                    // merged with the registered relay addresses.
+                    *dynamic_base.lock().unwrap() = value.to_owned();
+                    let mut list = dynamic_base.lock().unwrap().clone();
+                    for address in crate::management::registered_relay_addresses() {
+                        merge_relay_servers(&mut list, &address);
                     }
-                    "relay-servers" => {
-                        // Dynamic updates replace the static baseline and are
-                        // merged with the registered relay addresses.
-                        *dynamic_base.lock().unwrap() = value.to_owned();
-                        let mut list = dynamic_base.lock().unwrap().clone();
-                        for address in crate::management::registered_relay_addresses() {
-                            merge_relay_servers(&mut list, &address);
-                        }
-                        dynamic_tx.send(Data::RelayServers0(list)).is_ok()
-                    }
-                    _ => false,
-                },
-            ));
+                    dynamic_tx.send(Data::RelayServers0(list)).is_ok()
+                }
+                _ => false,
+            }));
             let sync_tx = tx.clone();
             let sync_base = static_relays;
             crate::management::set_relay_sync(Box::new(move |registered: Vec<String>| {

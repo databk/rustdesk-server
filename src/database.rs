@@ -142,6 +142,16 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    // Deletes the persisted row of a device id so a replacement machine
+    // (different uuid) can claim the id again; custom ids such as hostnames
+    // would otherwise stay bound to the retired machine forever.
+    pub async fn delete_peer(&self, id: &str) -> ResultType<u64> {
+        let result = sqlx::query!("delete from peer where id = ?", id)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +187,25 @@ mod tests {
             jobs.push(a);
         }
         hbb_common::futures::future::join_all(jobs).await;
+    }
+
+    #[tokio::test]
+    async fn delete_peer_releases_the_id() {
+        let path = std::env::temp_dir().join(format!(
+            "rustdesk-db-delete-{}-{:?}.sqlite3",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let db = super::Database::new(path.to_str().unwrap()).await.unwrap();
+        db.insert_peer("host-a", &[1], &[2], "").await.unwrap();
+        assert!(db.get_peer("host-a").await.unwrap().is_some());
+        assert_eq!(db.delete_peer("host-a").await.unwrap(), 1);
+        assert_eq!(db.delete_peer("host-a").await.unwrap(), 0);
+        assert!(db.get_peer("host-a").await.unwrap().is_none());
+        // The id can be claimed by a different machine afterwards.
+        db.insert_peer("host-a", &[3], &[4], "").await.unwrap();
+        assert!(db.get_peer("host-a").await.unwrap().is_some());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }

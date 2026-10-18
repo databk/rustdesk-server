@@ -11,7 +11,7 @@ use axum::{
         sse::{Event as SseEvent, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::get,
+    routing::{delete, get},
     Json, Router,
 };
 use hbb_common::{anyhow::anyhow, log, tokio, ResultType};
@@ -34,6 +34,17 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt as _};
 
 pub const REDACTED: &str = "__REDACTED__";
 static PEERS: Lazy<RwLock<Vec<Value>>> = Lazy::new(|| RwLock::new(Vec::new()));
+// Releases a device id from the hbbs registry (in-memory map plus sqlite
+// row); bridged in by the owning binary so the shared management API does
+// not depend on protocol internals. hbbr never registers one.
+pub type PeerReleaser = std::sync::Arc<
+    dyn Fn(&str) -> hbb_common::futures::future::BoxFuture<'static, ResultType<bool>> + Send + Sync,
+>;
+static PEER_RELEASER: Lazy<RwLock<Option<PeerReleaser>>> = Lazy::new(|| RwLock::new(None));
+
+pub fn set_peer_releaser(releaser: PeerReleaser) {
+    *PEER_RELEASER.write().unwrap() = Some(releaser);
+}
 static SESSIONS: Lazy<RwLock<HashMap<String, Session>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static BANS: Lazy<RwLock<Bans>> = Lazy::new(|| RwLock::new(Bans::default()));
 static BAN_UPDATES: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -740,6 +751,30 @@ async fn peers(Extension(state): Extension<ApiState>) -> Response {
     Json(json!({"data":PEERS.read().unwrap().clone()})).into_response()
 }
 
+// Releases a device id from the registry: forgets the in-memory entry and
+// deletes the persisted row. Without this, a custom id (e.g. a hostname)
+// stays bound to the retired machine's uuid and every registration of the
+// replacement machine is rejected with UUID_MISMATCH.
+async fn delete_peer(Path(id): Path<String>, Extension(state): Extension<ApiState>) -> Response {
+    if state.service != "hbbs" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let releaser = PEER_RELEASER.read().unwrap().clone();
+    let Some(releaser) = releaser else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match releaser(&id).await {
+        Ok(deleted) => {
+            emit_event("peer_released", json!({"id": id}));
+            Json(json!({"deleted": deleted})).into_response()
+        }
+        Err(err) => {
+            log::error!("Unable to release peer {id}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn bans() -> Json<Bans> {
     Json(BANS.read().unwrap().clone())
 }
@@ -1245,6 +1280,7 @@ fn router(state: ApiState) -> Router {
         .route("/v1/config", get(config).put(replace_config))
         .route("/v1/logs", get(logs))
         .route("/v1/peers", get(peers))
+        .route("/v1/peers/:id", delete(delete_peer))
         .route("/v1/bans", get(bans).put(replace_bans))
         .route("/v1/restart", axum::routing::post(restart))
         .route("/v1/events", get(events))
@@ -1378,6 +1414,67 @@ mod tests {
         std::fs::write(data_path("hbbs", "bans"), b"invalid policy").unwrap();
         assert!(restore_bans("hbbs").is_err());
     }
+    #[tokio::test]
+    async fn delete_peer_releases_the_id_through_the_bridged_releaser() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let requested = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let releaser: PeerReleaser = {
+            let calls = calls.clone();
+            let requested = requested.clone();
+            Arc::new(move |id: &str| {
+                let id = id.to_owned();
+                let calls = calls.clone();
+                let requested = requested.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    requested.lock().unwrap().push(id.clone());
+                    Ok(!id.is_empty())
+                })
+            })
+        };
+        set_peer_releaser(releaser);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = "test-management-token-that-is-at-least-32-characters";
+        let app = router(ApiState {
+            service: "hbbs",
+            token: token.into(),
+            started: Instant::now(),
+        });
+        let task = tokio::spawn(
+            axum::Server::from_tcp(listener)
+                .unwrap()
+                .serve(app.into_make_service()),
+        );
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!(
+            "DELETE /v1/peers/host-a HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"deleted\":true"), "{response}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*requested.lock().unwrap(), vec!["host-a".to_owned()]);
+
+        // Without a bridged releaser the endpoint reports it is unavailable.
+        *PEER_RELEASER.write().unwrap() = None;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        task.abort();
+    }
+
     #[tokio::test]
     async fn http_routes_require_authorization_and_do_not_leak_tokens() {
         use tokio::{
