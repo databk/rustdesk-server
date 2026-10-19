@@ -1,5 +1,6 @@
 mod command;
 mod helper;
+mod inspect;
 mod listener;
 mod punch_hole;
 mod register;

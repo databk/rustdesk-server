@@ -145,12 +145,22 @@ impl RendezvousServer {
                     }
                 }
                 if !dup {
+                    crate::management::publish_event(
+                        "connect_attempt",
+                        serde_json::json!({"from_ip": from_ip, "to_id": to_id_clone, "to_ip": to_ip}),
+                    );
                     lock.push(PunchReqEntry {
                         tm: Instant::now(),
                         from_ip,
                         to_ip,
                         to_id: to_id_clone,
                     });
+                    // Bound the log: it is only ever read through the console
+                    // and the management API.
+                    if lock.len() > super::inspect::PUNCH_REQS_MAX {
+                        let excess = lock.len() - super::inspect::PUNCH_REQS_MAX;
+                        lock.drain(..excess);
+                    }
                 }
             }
 

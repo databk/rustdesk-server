@@ -84,6 +84,9 @@ impl RendezvousServer {
                 let id = id.to_owned();
                 Box::pin(async move { pm.release(&id).await })
             }));
+            crate::management::set_inspector(std::sync::Arc::new(|request| {
+                Box::pin(super::inspect::inspect(request))
+            }));
             tokio::spawn(async move {
                 let mut timer = interval(Duration::from_secs(2));
                 loop {

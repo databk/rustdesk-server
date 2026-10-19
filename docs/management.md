@@ -17,3 +17,13 @@ Files are service-specific: `hbbs-config.json`, `hbbr-config.json`, `hbbs-bans.j
 Managed settings override startup inputs. Schema and validation are provided by `management-schema.json`. The API returns key placeholders, never the private key. It exposes only `id_ed25519.pub` as the public key.
 
 The published `databk/rustdesk-server` image ships hbbs and hbbr with the management API compiled in; deploy each binary as its own container (for example through the Console repository's Compose `server` profile), set `RD_MANAGEMENT_BIND` on hbbs to enable its listener, and set `RD_HBBS_API_URL` on hbbr so it registers on the control channel. The Console repository supplies the combined Compose deployment, permission enforcement, UI, integration workflow and detailed lifecycle documentation in `docs/server-management.md`. Existing binaries remain compatible with deployments that do not enable management.
+
+## Inspection endpoints (hbbs only)
+
+These expose state the local text console already worked on, as JSON. All require authorization; hbbr answers `404`. They return `503` until the hbbs binary has bridged its state in (management listener disabled).
+
+- `GET /v1/connections?offset=&limit=` lists recent connection (punch-hole) attempts, newest first: `{ "total", "offset", "limit", "data": [{ "time", "age_seconds", "from_ip", "to_id", "to_ip" }] }`. `limit` defaults to 100 and is clamped to 1000. Attempts by the same source to the same id within 60 seconds are recorded once. The log is in memory, capped at 10000 entries (oldest dropped) and lost on restart. `DELETE /v1/connections` clears it (`{ "cleared": n }`). Each new attempt is also published as a `connect_attempt` event on `/v1/events` with `{ from_ip, to_id, to_ip }`.
+- `GET /v1/abuse/ip-blocker` lists addresses tracked by the registration abuse limiter, blocked ones first: `requests_in_window` (per 60 s), `rate_limited` (more than 30 requests in the window), `distinct_ids_24h`, `id_flood` (more than 300 distinct ids in 24 h). `GET /v1/abuse/ip-blocker/:ip` adds the observed `ids` (up to 1000) and answers `404` for an unknown address; `DELETE` forgets the address (`{ "deleted": bool }`).
+- `GET /v1/abuse/ip-changes` lists device ids that registered from several addresses recently (most addresses first), with per-address registration counts. `GET /v1/abuse/ip-changes/:id` and `DELETE` work as above.
+
+Relay selection for clients is a plain round-robin over the live relay server list; there is no geographic routing.

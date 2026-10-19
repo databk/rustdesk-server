@@ -45,6 +45,40 @@ static PEER_RELEASER: Lazy<RwLock<Option<PeerReleaser>>> = Lazy::new(|| RwLock::
 pub fn set_peer_releaser(releaser: PeerReleaser) {
     *PEER_RELEASER.write().unwrap() = Some(releaser);
 }
+
+// Read and maintenance requests for hbbs internals the management module
+// cannot reach itself (connection log, abuse tracking). The owning binary
+// bridges them in; hbbr never registers an inspector. A `Null` answer means
+// the requested entry does not exist.
+#[derive(Debug, Clone)]
+pub enum Inspect {
+    Connections { offset: usize, limit: usize },
+    ClearConnections,
+    IpBlockers { offset: usize, limit: usize },
+    IpBlocker { ip: String },
+    ReleaseIpBlocker { ip: String },
+    IpChanges { offset: usize, limit: usize },
+    IpChange { id: String },
+    ReleaseIpChange { id: String },
+}
+pub type Inspector = std::sync::Arc<
+    dyn Fn(Inspect) -> hbb_common::futures::future::BoxFuture<'static, ResultType<Value>>
+        + Send
+        + Sync,
+>;
+static INSPECTOR: Lazy<RwLock<Option<Inspector>>> = Lazy::new(|| RwLock::new(None));
+
+#[allow(dead_code)] // Only the hbbs binary registers an inspector.
+pub fn set_inspector(inspector: Inspector) {
+    *INSPECTOR.write().unwrap() = Some(inspector);
+}
+
+// Lets hbbs publish its own events (for example connection attempts) on the
+// aggregated /v1/events stream.
+#[allow(dead_code)]
+pub fn publish_event(kind: &str, data: Value) {
+    emit_event(kind, data);
+}
 static SESSIONS: Lazy<RwLock<HashMap<String, Session>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static BANS: Lazy<RwLock<Bans>> = Lazy::new(|| RwLock::new(Bans::default()));
 static BAN_UPDATES: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -775,6 +809,92 @@ async fn delete_peer(Path(id): Path<String>, Extension(state): Extension<ApiStat
     }
 }
 
+#[derive(Clone, Copy, Deserialize)]
+struct PageQuery {
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+impl PageQuery {
+    fn bounds(self) -> (usize, usize) {
+        (
+            self.offset.unwrap_or(0),
+            self.limit.unwrap_or(100).clamp(1, 1000),
+        )
+    }
+}
+
+async fn inspect(state: &ApiState, request: Inspect) -> Response {
+    if state.service != "hbbs" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let inspector = INSPECTOR.read().unwrap().clone();
+    let Some(inspector) = inspector else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match inspector(request).await {
+        Ok(Value::Null) => StatusCode::NOT_FOUND.into_response(),
+        Ok(value) => Json(value).into_response(),
+        Err(err) => {
+            log::error!("Unable to inspect hbbs state: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// Log of recent punch-hole (connection attempt) requests, newest first.
+async fn connections(
+    Extension(state): Extension<ApiState>,
+    Query(page): Query<PageQuery>,
+) -> Response {
+    let (offset, limit) = page.bounds();
+    inspect(&state, Inspect::Connections { offset, limit }).await
+}
+
+async fn clear_connections(Extension(state): Extension<ApiState>) -> Response {
+    inspect(&state, Inspect::ClearConnections).await
+}
+
+async fn ip_blockers(
+    Extension(state): Extension<ApiState>,
+    Query(page): Query<PageQuery>,
+) -> Response {
+    let (offset, limit) = page.bounds();
+    inspect(&state, Inspect::IpBlockers { offset, limit }).await
+}
+
+async fn ip_blocker(Path(ip): Path<String>, Extension(state): Extension<ApiState>) -> Response {
+    inspect(&state, Inspect::IpBlocker { ip }).await
+}
+
+async fn release_ip_blocker(
+    Path(ip): Path<String>,
+    Extension(state): Extension<ApiState>,
+) -> Response {
+    inspect(&state, Inspect::ReleaseIpBlocker { ip }).await
+}
+
+async fn ip_changes(
+    Extension(state): Extension<ApiState>,
+    Query(page): Query<PageQuery>,
+) -> Response {
+    let (offset, limit) = page.bounds();
+    inspect(&state, Inspect::IpChanges { offset, limit }).await
+}
+
+async fn ip_change(Path(id): Path<String>, Extension(state): Extension<ApiState>) -> Response {
+    inspect(&state, Inspect::IpChange { id }).await
+}
+
+async fn release_ip_change(
+    Path(id): Path<String>,
+    Extension(state): Extension<ApiState>,
+) -> Response {
+    inspect(&state, Inspect::ReleaseIpChange { id }).await
+}
+
 async fn bans() -> Json<Bans> {
     Json(BANS.read().unwrap().clone())
 }
@@ -1281,6 +1401,20 @@ fn router(state: ApiState) -> Router {
         .route("/v1/logs", get(logs))
         .route("/v1/peers", get(peers))
         .route("/v1/peers/:id", delete(delete_peer))
+        .route(
+            "/v1/connections",
+            get(connections).delete(clear_connections),
+        )
+        .route("/v1/abuse/ip-blocker", get(ip_blockers))
+        .route(
+            "/v1/abuse/ip-blocker/:ip",
+            get(ip_blocker).delete(release_ip_blocker),
+        )
+        .route("/v1/abuse/ip-changes", get(ip_changes))
+        .route(
+            "/v1/abuse/ip-changes/:id",
+            get(ip_change).delete(release_ip_change),
+        )
         .route("/v1/bans", get(bans).put(replace_bans))
         .route("/v1/restart", axum::routing::post(restart))
         .route("/v1/events", get(events))
@@ -1473,6 +1607,98 @@ mod tests {
         stream.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn inspection_routes_map_requests_and_report_availability() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpStream,
+        };
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let token = "test-management-token-that-is-at-least-32-characters";
+        let serve = |service: &'static str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = router(ApiState {
+                service,
+                token: token.into(),
+                started: Instant::now(),
+            });
+            let task = tokio::spawn(
+                axum::Server::from_tcp(listener)
+                    .unwrap()
+                    .serve(app.into_make_service()),
+            );
+            (address, task)
+        };
+        let call = |address: SocketAddr, method: &'static str, path: &'static str| async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            response
+        };
+        let (hbbs, hbbs_task) = serve("hbbs");
+        let (hbbr, hbbr_task) = serve("hbbr");
+
+        // Not bridged yet: the endpoints say so instead of returning empty data.
+        *INSPECTOR.write().unwrap() = None;
+        let response = call(hbbs, "GET", "/v1/connections").await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+
+        let inspector: Inspector = {
+            let requested = requested.clone();
+            std::sync::Arc::new(move |request: Inspect| {
+                requested.lock().unwrap().push(format!("{request:?}"));
+                Box::pin(async move {
+                    Ok(match request {
+                        Inspect::IpBlocker { .. } | Inspect::IpChange { .. } => Value::Null,
+                        Inspect::ReleaseIpBlocker { .. } | Inspect::ReleaseIpChange { .. } => {
+                            json!({"deleted": true})
+                        }
+                        _ => json!({"total": 0, "data": []}),
+                    })
+                })
+            })
+        };
+        set_inspector(inspector);
+
+        let response = call(hbbs, "GET", "/v1/connections?offset=5&limit=5000").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        // Limits are clamped; an absent offset/limit falls back to defaults.
+        let response = call(hbbs, "GET", "/v1/abuse/ip-changes").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let response = call(hbbs, "DELETE", "/v1/connections").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let response = call(hbbs, "GET", "/v1/abuse/ip-blocker/203.0.113.9").await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        let response = call(hbbs, "DELETE", "/v1/abuse/ip-blocker/203.0.113.9").await;
+        assert!(response.contains("\"deleted\":true"), "{response}");
+        let response = call(hbbs, "DELETE", "/v1/abuse/ip-changes/host-a").await;
+        assert!(response.contains("\"deleted\":true"), "{response}");
+        // hbbr has no such state.
+        let response = call(hbbr, "GET", "/v1/connections").await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+
+        assert_eq!(
+            *requested.lock().unwrap(),
+            vec![
+                "Connections { offset: 5, limit: 1000 }",
+                "IpChanges { offset: 0, limit: 100 }",
+                "ClearConnections",
+                "IpBlocker { ip: \"203.0.113.9\" }",
+                "ReleaseIpBlocker { ip: \"203.0.113.9\" }",
+                "ReleaseIpChange { id: \"host-a\" }",
+            ]
+        );
+        *INSPECTOR.write().unwrap() = None;
+        hbbs_task.abort();
+        hbbr_task.abort();
     }
 
     #[tokio::test]
