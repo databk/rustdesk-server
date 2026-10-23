@@ -8,8 +8,12 @@ use crate::management;
 use hbb_common::futures_util::{sink::SinkExt as _, stream::StreamExt as _};
 use hbb_common::tokio::sync::mpsc;
 use hbb_common::{anyhow::anyhow, log, tokio, ResultType};
+use reqwest::Url;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    cell::Cell,
+    time::{Duration, Instant},
+};
 use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
     MaybeTlsStream, WebSocketStream,
@@ -25,8 +29,10 @@ pub fn start(url: &str, token: &str) -> ResultType<()> {
             "RD_MANAGEMENT_TOKEN must contain at least 32 characters"
         ));
     }
-    let url = url.to_owned();
-    let token = token.to_owned();
+    let url = normalize_control_url(url)?;
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| anyhow!("RD_MANAGEMENT_TOKEN must be a valid Bearer header value"))?;
+    authorization.set_sensitive(true);
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         // The receiver is taken once for the whole task: run() must not take
@@ -34,7 +40,7 @@ pub fn start(url: &str, token: &str) -> ResultType<()> {
         // session event feed.
         let mut events = management::take_control_receiver();
         loop {
-            match run(&url, &token, &mut events).await {
+            match run(&url, &authorization, &mut events).await {
                 Ok(registered) => {
                     if registered {
                         // A healthy connection just ended; retry promptly
@@ -50,6 +56,61 @@ pub fn start(url: &str, token: &str) -> ResultType<()> {
         }
     });
     Ok(())
+}
+
+fn normalize_control_url(value: &str) -> ResultType<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("RD_HBBS_API_URL must contain a host"));
+    }
+    let candidate = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("ws://{value}")
+    };
+    // Configuration must not be silently repaired by the URL parser (for
+    // example, by dropping embedded newlines or accepting extra slashes).
+    let malformed = Cell::new(false);
+    let on_violation = |_| malformed.set(true);
+    let mut url = Url::options()
+        .syntax_violation_callback(Some(&on_violation))
+        .parse(&candidate)
+        .map_err(|err| anyhow!("RD_HBBS_API_URL is invalid: {err}"))?;
+    let scheme = match url.scheme() {
+        "http" | "ws" => "ws",
+        "https" | "wss" => "wss",
+        _ => {
+            return Err(anyhow!("RD_HBBS_API_URL must use http, https, ws or wss"));
+        }
+    };
+    if url.host_str().is_none() {
+        return Err(anyhow!("RD_HBBS_API_URL must contain a host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!("RD_HBBS_API_URL must not contain credentials"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(anyhow!(
+            "RD_HBBS_API_URL must not contain a query or fragment"
+        ));
+    }
+    if malformed.get() {
+        return Err(anyhow!("RD_HBBS_API_URL has invalid URL syntax"));
+    }
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow!("RD_HBBS_API_URL has an invalid scheme"))?;
+    let path = url.path().trim_end_matches('/');
+    let path = if path.is_empty() {
+        "/v1/control".to_owned()
+    } else {
+        path.to_owned()
+    };
+    url.set_path(&path);
+    // Validate the WebSocket request before spawning the reconnect loop.
+    url.as_str()
+        .into_client_request()
+        .map_err(|_| anyhow!("RD_HBBS_API_URL is not a valid WebSocket URL"))?;
+    Ok(url.into())
 }
 
 // The relay id identifies the node; the advertised address is optional.
@@ -76,14 +137,13 @@ fn relay_identity() -> (String, Option<String>) {
 // ended, which lets the caller reset its reconnect backoff.
 async fn run(
     url: &str,
-    token: &str,
+    authorization: &HeaderValue,
     events: &mut Option<mpsc::UnboundedReceiver<Value>>,
 ) -> ResultType<bool> {
     let mut request = url.into_client_request()?;
-    request.headers_mut().insert(
-        "authorization",
-        HeaderValue::from_str(&format!("Bearer {token}"))?,
-    );
+    request
+        .headers_mut()
+        .insert("authorization", authorization.clone());
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await?;
     let (id, address) = relay_identity();
     let mut register = json!({
@@ -262,4 +322,143 @@ fn schedule_restart() {
         log::info!("Exiting for restart; the supervisor should bring the relay back");
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    const TOKEN: &str = "relay-control-test-token-32-characters";
+
+    #[test]
+    fn normalizes_control_url_inputs() {
+        for (input, expected) in [
+            ("http://hbbs:21120", "ws://hbbs:21120/v1/control"),
+            ("http://hbbs:21120/", "ws://hbbs:21120/v1/control"),
+            ("https://example.com", "wss://example.com/v1/control"),
+            ("ws://hbbs:21120", "ws://hbbs:21120/v1/control"),
+            ("wss://example.com/", "wss://example.com/v1/control"),
+            ("hbbs:21120", "ws://hbbs:21120/v1/control"),
+            ("hbbs", "ws://hbbs/v1/control"),
+            ("127.0.0.1:21120", "ws://127.0.0.1:21120/v1/control"),
+            ("[::1]:21120", "ws://[::1]:21120/v1/control"),
+            ("http://[::1]:21120", "ws://[::1]:21120/v1/control"),
+            ("https://[2001:db8::1]", "wss://[2001:db8::1]/v1/control"),
+            ("  \nhttp://hbbs:21120/\t ", "ws://hbbs:21120/v1/control"),
+            ("ws://hbbs:21120/v1/control", "ws://hbbs:21120/v1/control"),
+            (
+                "https://example.com/proxy/v1/control///",
+                "wss://example.com/proxy/v1/control",
+            ),
+            (
+                "hbbs:21120/custom/control/",
+                "ws://hbbs:21120/custom/control",
+            ),
+            (
+                "ws://hbbs:21120/proxy%2Fcontrol/",
+                "ws://hbbs:21120/proxy%2Fcontrol",
+            ),
+            ("HTTP://HBBS:21120", "ws://hbbs:21120/v1/control"),
+            ("http://hbbs:80", "ws://hbbs/v1/control"),
+            ("https://hbbs:443/", "wss://hbbs/v1/control"),
+            ("ws://hbbs:65535", "ws://hbbs:65535/v1/control"),
+        ] {
+            assert_eq!(normalize_control_url(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_configuration_fails_before_spawning() {
+        // No Tokio runtime is present: trying to spawn for these inputs would
+        // panic instead of returning the required configuration error.
+        for input in [
+            "",
+            "   ",
+            "http://",
+            "ws://:21120",
+            "http:///hbbs:21120",
+            "//hbbs:21120",
+            "ftp://hbbs:21120",
+            "file:///tmp/hbbs",
+            "hbbs:not-a-port",
+            "ws://hbbs:65536",
+            "ws://hbbs:-1",
+            "ws://[:::1]:21120",
+            "::1:21120",
+            "ws://user:private-password@hbbs:21120",
+            "ws://@hbbs:21120",
+            "ws://hbbs:21120?token=private-token",
+            "ws://hbbs:21120/?",
+            "ws://hbbs:21120/#private-token",
+            "ws://hbbs:21120/#",
+            "ws://hb\nbs:21120",
+            "ws://hbbs:21120/a b",
+            "ws://hbbs:21120/a%zz",
+            "ws://hbbs:21120\\v1\\control",
+        ] {
+            let error = start(input, TOKEN).unwrap_err().to_string();
+            assert!(error.contains("RD_HBBS_API_URL"), "{input:?}: {error}");
+            assert!(!error.contains("private-password"));
+            assert!(!error.contains("private-token"));
+            assert!(!error.contains(TOKEN));
+        }
+    }
+
+    #[test]
+    fn invalid_token_fails_before_spawning() {
+        for token in ["short".to_owned(), format!("{TOKEN}\r\nX-Header: secret")] {
+            let error = start("http://hbbs:21120", &token).unwrap_err().to_string();
+            assert!(error.contains("RD_MANAGEMENT_TOKEN"));
+            assert!(!error.contains(&token));
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn normalized_http_url_registers_over_websocket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &Request, response: Response| {
+                    assert_eq!(request.uri().path(), "/v1/control");
+                    assert_eq!(
+                        request.headers()["authorization"],
+                        format!("Bearer {TOKEN}")
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let registration = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let registration: Value = serde_json::from_str(&registration).unwrap();
+            assert_eq!(registration["type"], "register");
+            assert!(registration["relay"]["id"].is_string());
+            let heartbeat = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let heartbeat: Value = serde_json::from_str(&heartbeat).unwrap();
+            assert_eq!(heartbeat["type"], "heartbeat");
+            socket.close(None).await.unwrap();
+            while let Some(message) = socket.next().await {
+                if message.unwrap().is_close() {
+                    break;
+                }
+            }
+        });
+        let url = normalize_control_url(&format!("http://{address}")).unwrap();
+        let authorization = HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap();
+        let mut events = None;
+        let registered = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(&url, &authorization, &mut events),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(registered);
+        server.await.unwrap();
+    }
 }
