@@ -192,6 +192,16 @@ async fn run_registered(
                     "uptime_seconds": started.elapsed().as_secs(),
                 });
                 socket.send(Message::Text(beat.to_string())).await?;
+                // Traffic counters only change inside hbbr; without a periodic
+                // snapshot hbbs keeps the values from session_opened (0 bytes).
+                let sessions = management::sessions_snapshot();
+                if !sessions.is_empty() {
+                    let snapshot = json!({
+                        "type": "sessions",
+                        "data": sessions,
+                    });
+                    socket.send(Message::Text(snapshot.to_string())).await?;
+                }
             }
             event = async {
                 match events.as_mut() {
@@ -432,7 +442,6 @@ mod tests {
             assert!(!error.contains("secret"));
         }
     }
-
 
     #[tokio::test]
     async fn normalized_http_url_registers_over_websocket() {

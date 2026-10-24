@@ -33,6 +33,11 @@ use std::{
 };
 
 pub(crate) const REG_TIMEOUT: i64 = 30_000;
+// Server-initiated keep-alive on TCP/WS rendezvous connections. Must stay below
+// REG_TIMEOUT so a connected peer's registration never expires.
+pub(crate) const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+// Close a TCP/WS rendezvous connection after this long without any message.
+pub(crate) const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 pub(crate) const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 pub(crate) const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 
