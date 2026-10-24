@@ -68,6 +68,16 @@ fn normalize_control_url(value: &str) -> ResultType<String> {
     } else {
         format!("ws://{value}")
     };
+    // Reject an explicitly empty port such as "ws://hbbs:" or "ws://[::1]:/p"
+    // before the parser silently drops it and falls back to the scheme default.
+    let authority = candidate
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or("");
+    if authority.ends_with(':') {
+        return Err(anyhow!("RD_HBBS_API_URL must not specify an empty port"));
+    }
     // Configuration must not be silently repaired by the URL parser (for
     // example, by dropping embedded newlines or accepting extra slashes).
     let malformed = Cell::new(false);
@@ -76,6 +86,10 @@ fn normalize_control_url(value: &str) -> ResultType<String> {
         .syntax_violation_callback(Some(&on_violation))
         .parse(&candidate)
         .map_err(|err| anyhow!("RD_HBBS_API_URL is invalid: {err}"))?;
+    // Port 0 is syntactically valid but unusable as a connect destination.
+    if url.port() == Some(0) {
+        return Err(anyhow!("RD_HBBS_API_URL must not use port 0"));
+    }
     let scheme = match url.scheme() {
         "http" | "ws" => "ws",
         "https" | "wss" => "wss",
@@ -384,6 +398,10 @@ mod tests {
             "hbbs:not-a-port",
             "ws://hbbs:65536",
             "ws://hbbs:-1",
+            "ws://hbbs:0",
+            "ws://hbbs:",
+            "ws://[::1]:",
+            "ws://[::1]:/v1/control",
             "ws://[:::1]:21120",
             "::1:21120",
             "ws://user:private-password@hbbs:21120",
@@ -414,6 +432,7 @@ mod tests {
             assert!(!error.contains("secret"));
         }
     }
+
 
     #[tokio::test]
     async fn normalized_http_url_registers_over_websocket() {
