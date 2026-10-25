@@ -14,7 +14,7 @@ use axum::{
     routing::{delete, get},
     Json, Router,
 };
-use hbb_common::{anyhow::anyhow, log, tokio, ResultType};
+use hbb_common::{anyhow::anyhow, log, protobuf::Message as _, relay_control_proto as proto, tokio, ResultType};
 use once_cell::sync::Lazy;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -152,14 +152,90 @@ fn sync_relay_list() {
     }
 }
 
-fn relay_command(relay_id: &str, payload: Value) -> ResultType<()> {
+// ---- protobuf <-> domain helpers for the control channel ----
+
+fn encode(msg: &proto::ControlMessage) -> Vec<u8> {
+    let mut v = Vec::new();
+    msg.write_to_vec(&mut v).ok();
+    v
+}
+
+fn bans_to_proto(bans: &Bans) -> proto::Bans {
+    proto::Bans {
+        device_ids: bans.device_ids.clone(),
+        ips: bans.ips.clone(),
+        ..Default::default()
+    }
+}
+
+pub fn bans_from_proto(b: &proto::Bans) -> Bans {
+    Bans {
+        device_ids: b.device_ids.clone(),
+        ips: b.ips.clone(),
+    }
+}
+
+fn session_from_proto(s: &proto::SessionInfo) -> Value {
+    json!({
+        "uuid": s.uuid,
+        "target_id": s.target_id,
+        "peer_target_id": s.peer_target_id,
+        "endpoints": s.endpoints,
+        "transport": s.transport,
+        "started_at": s.started_at,
+        "bytes": s.bytes,
+        "bytes_per_second": s.bytes_per_second,
+        "closing": s.closing,
+    })
+}
+
+pub fn session_to_proto(info: &Value) -> proto::SessionInfo {
+    proto::SessionInfo {
+        uuid: info["uuid"].as_str().unwrap_or_default().to_owned(),
+        target_id: info["target_id"].as_str().unwrap_or_default().to_owned(),
+        peer_target_id: info["peer_target_id"].as_str().unwrap_or_default().to_owned(),
+        endpoints: info["endpoints"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        transport: info["transport"].as_str().unwrap_or_default().to_owned(),
+        started_at: info["started_at"].as_i64().unwrap_or_default(),
+        bytes: info["bytes"].as_u64().unwrap_or_default(),
+        bytes_per_second: info["bytes_per_second"].as_u64().unwrap_or_default(),
+        closing: info["closing"].as_bool().unwrap_or(false),
+        ..Default::default()
+    }
+}
+
+fn stats_from_proto(s: &proto::HostStats) -> Value {
+    let mut v = json!({
+        "active_sessions": s.active_sessions,
+        "bytes_per_second": s.bytes_per_second,
+    });
+    if s.cpu_usage >= 0.0 {
+        v["cpu_usage"] = json!(s.cpu_usage);
+    }
+    if s.mem_usage >= 0.0 {
+        v["mem_usage"] = json!(s.mem_usage);
+    }
+    if s.max_sessions > 0 {
+        v["max_sessions"] = json!(s.max_sessions);
+    }
+    v
+}
+
+fn relay_command(relay_id: &str, msg: &proto::ControlMessage) -> ResultType<()> {
     let relays = RELAYS.read().unwrap();
     let relay = relays
         .get(relay_id)
         .ok_or_else(|| anyhow!("Unknown relay: {relay_id}"))?;
     relay
         .tx
-        .send(Message::Text(payload.to_string()))
+        .send(Message::Binary(encode(msg)))
         .map_err(|_| anyhow!("Relay control channel is closed"))?;
     Ok(())
 }
@@ -170,10 +246,18 @@ static BANS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn fanout_bans() {
     let seq = BANS_SEQ.load(Ordering::SeqCst);
-    let payload = json!({"type": "bans", "id": seq, "bans": *BANS.read().unwrap()});
-    let text = payload.to_string();
+    let msg = proto::ControlMessage {
+        payload: Some(proto::control_message::Payload::Bans(proto::BansUpdate {
+            id: seq,
+            bans: Some(bans_to_proto(&BANS.read().unwrap())).into(),
+            ..Default::default()
+        })),
+    
+        ..Default::default()
+    };
+    let bytes = encode(&msg);
     for relay in RELAYS.read().unwrap().values() {
-        let _ = relay.tx.send(Message::Text(text.clone()));
+        let _ = relay.tx.send(Message::Binary(bytes.clone()));
     }
 }
 
@@ -182,7 +266,7 @@ fn fanout_bans() {
 // it from the "response" control message.
 struct PendingRelayRequest {
     relay: String,
-    responder: oneshot::Sender<Value>,
+    responder: oneshot::Sender<proto::ControlResponse>,
 }
 
 static RELAY_REQUESTS: Lazy<std::sync::Mutex<HashMap<u64, PendingRelayRequest>>> =
@@ -191,13 +275,15 @@ static RELAY_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Sends a command carrying a request id to one relay and awaits the matching
-// response, so HTTP handlers can proxy relay-scoped reads and writes.
-async fn relay_request(relay_id: &str, mut payload: Value) -> ResultType<Value> {
+// response, so HTTP handlers can proxy relay-scoped reads and writes. The
+// caller supplies a closure that stamps the allocated id onto the message.
+async fn relay_request<F>(relay_id: &str, make: F) -> ResultType<proto::ControlResponse>
+where
+    F: FnOnce(u64) -> proto::ControlMessage,
+{
     let (responder, waiter) = oneshot::channel();
     let id = RELAY_REQUEST_SEQUENCE.fetch_add(1, Ordering::SeqCst);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("id".to_owned(), json!(id));
-    }
+    let msg = make(id);
     RELAY_REQUESTS.lock().unwrap().insert(
         id,
         PendingRelayRequest {
@@ -205,7 +291,7 @@ async fn relay_request(relay_id: &str, mut payload: Value) -> ResultType<Value> 
             responder,
         },
     );
-    if let Err(err) = relay_command(relay_id, payload) {
+    if let Err(err) = relay_command(relay_id, &msg) {
         RELAY_REQUESTS.lock().unwrap().remove(&id);
         return Err(err);
     }
@@ -233,8 +319,8 @@ fn cancel_relay_requests(relay_id: &str) {
 // after a consumer has taken the receiver, so a relay without the control
 // channel does not accumulate session events forever.
 static CONTROL_OUT: Lazy<(
-    mpsc::UnboundedSender<Value>,
-    std::sync::Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    mpsc::UnboundedSender<proto::ControlMessage>,
+    std::sync::Mutex<Option<mpsc::UnboundedReceiver<proto::ControlMessage>>>,
 )> = Lazy::new(|| {
     let (tx, rx) = mpsc::unbounded_channel();
     (tx, std::sync::Mutex::new(Some(rx)))
@@ -246,7 +332,8 @@ static CONTROL_CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 // hbbs can ask the relay to replay events hbbs missed by sending replay_events
 // with the next expected sequence (see #15).
 static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
-static EVENT_BUFFER: Lazy<RwLock<VecDeque<Value>>> = Lazy::new(|| RwLock::new(VecDeque::new()));
+static EVENT_BUFFER: Lazy<RwLock<VecDeque<proto::ControlMessage>>> =
+    Lazy::new(|| RwLock::new(VecDeque::new()));
 const EVENT_BUFFER_CAPACITY: usize = 1024;
 
 // Highest event sequence observed from each relay, kept independently of the
@@ -256,15 +343,20 @@ const EVENT_BUFFER_CAPACITY: usize = 1024;
 static RELAY_EVENT_CURSORS: Lazy<RwLock<HashMap<String, u64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn control_emit(event: Value) {
+fn control_emit(event: proto::SessionEvent) {
     if CONTROL_CONSUMED.load(std::sync::atomic::Ordering::Relaxed) {
         // Hold the buffer write lock across sequence assignment, buffering and
         // delivery so concurrent callers cannot assign a later sequence and
         // send it before an earlier one (see #15).
         let mut buffer = EVENT_BUFFER.write().unwrap();
         let seq = EVENT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut message = event;
-        message["seq"] = json!(seq);
+        let mut event = event;
+        event.seq = seq;
+        let message = proto::ControlMessage {
+            payload: Some(proto::control_message::Payload::Event(event)),
+        
+        ..Default::default()
+    };
         buffer.push_back(message.clone());
         while buffer.len() > EVENT_BUFFER_CAPACITY {
             buffer.pop_front();
@@ -282,21 +374,20 @@ pub fn last_event_seq() -> u64 {
 // Returns buffered events with sequence numbers >= from_seq, oldest first.
 // If the gap predates the buffer the replay is partial; hbbs learns the
 // oldest available sequence from the returned events themselves.
-pub fn replay_events_since(from_seq: u64) -> Vec<Value> {
+pub fn replay_events_since(from_seq: u64) -> Vec<proto::ControlMessage> {
     EVENT_BUFFER
         .read()
         .unwrap()
         .iter()
-        .filter(|event| {
-            event["seq"]
-                .as_u64()
-                .map_or(false, |seq| seq >= from_seq)
+        .filter(|msg| match &msg.payload {
+            Some(proto::control_message::Payload::Event(ev)) => ev.seq >= from_seq,
+            _ => false,
         })
         .cloned()
         .collect()
 }
 
-pub fn take_control_receiver() -> Option<mpsc::UnboundedReceiver<Value>> {
+pub fn take_control_receiver() -> Option<mpsc::UnboundedReceiver<proto::ControlMessage>> {
     let receiver = CONTROL_OUT.1.lock().unwrap().take();
     if receiver.is_some() {
         CONTROL_CONSUMED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -422,8 +513,12 @@ pub fn open_session(
             cancel: Some(tx),
         },
     );
-    control_emit(json!({"type": "event", "event": {
-        "kind": "session_opened", "session": info, "uuid": uuid}}));
+    control_emit(proto::SessionEvent {
+        kind: proto::session_event::Kind::SESSION_OPENED.into(),
+        uuid: uuid.to_owned(),
+        session: Some(session_to_proto(&info)).into(),
+        ..Default::default()
+    });
     Some(rx)
 }
 
@@ -436,8 +531,11 @@ pub fn update_session(uuid: &str, bytes: usize, speed: usize) {
 
 pub fn close_session(uuid: &str) {
     SESSIONS.write().unwrap().remove(uuid);
-    control_emit(json!({"type": "event", "event": {
-        "kind": "session_closed", "uuid": uuid}}));
+    control_emit(proto::SessionEvent {
+        kind: proto::session_event::Kind::SESSION_CLOSED.into(),
+        uuid: uuid.to_owned(),
+        ..Default::default()
+    });
 }
 
 // Snapshot of the active relay sessions, sorted by uuid.
@@ -1009,30 +1107,26 @@ fn valid_relay_text(value: &str, max: usize) -> Option<String> {
 
 async fn control_socket(mut socket: WebSocket) {
     // Registration is the first frame; the connection is dropped otherwise.
-    let register = match tokio::time::timeout(Duration::from_secs(10), socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => text,
+    let register_bytes = match tokio::time::timeout(Duration::from_secs(10), socket.recv()).await {
+        Ok(Some(Ok(Message::Binary(bytes)))) => bytes,
         _ => return,
     };
-    let register: Value = match serde_json::from_str::<Value>(&register) {
-        Ok(value) if value["type"] == "register" => value,
+    let message = match proto::ControlMessage::parse_from_bytes(&register_bytes) {
+        Ok(msg) => msg,
+        Err(_) => return,
+    };
+    let register = match message.payload {
+        Some(proto::control_message::Payload::Register(r)) => r,
         _ => return,
     };
-    let relay_id = match register["relay"]["id"]
-        .as_str()
-        .and_then(|id| valid_relay_text(id, 100))
-    {
+    let relay_id = match valid_relay_text(&register.relay.id, 100) {
         Some(id) => id,
         None => return,
     };
-    let address = register["relay"]["address"]
-        .as_str()
-        .and_then(|address| valid_relay_text(address, 253));
-    let version = register["relay"]["version"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    let info = register["relay"].clone();
-    let relay_last_event_seq = register["last_event_seq"].as_u64().unwrap_or(0);
+    let address = valid_relay_text(&register.relay.address, 253);
+    let version = register.relay.version.clone();
+    let info = serde_json::json!({"id": relay_id, "version": version, "address": address});
+    let relay_last_event_seq = register.last_event_seq;
     let generation = RELAY_GENERATION.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     // Read the observed event cursor from a map that survives control socket
@@ -1083,24 +1177,45 @@ async fn control_socket(mut socket: WebSocket) {
     // Bring the new relay up to date with the active policy and request a
     // session snapshot so aggregation is complete right after registration.
     let bans_seq = BANS_SEQ.load(Ordering::SeqCst);
-    let _ = tx.send(Message::Text(
-        json!({"type": "bans", "id": bans_seq, "bans": *BANS.read().unwrap()}).to_string(),
-    ));
-    let _ = tx.send(Message::Text(json!({"type": "get_sessions"}).to_string()));
+    let _ = tx.send(Message::Binary(encode(&proto::ControlMessage {
+        payload: Some(proto::control_message::Payload::Bans(proto::BansUpdate {
+            id: bans_seq,
+            bans: Some(bans_to_proto(&BANS.read().unwrap())).into(),
+            ..Default::default()
+        })),
+    
+        ..Default::default()
+    })));
+    let _ = tx.send(Message::Binary(encode(&proto::ControlMessage {
+        payload: Some(proto::control_message::Payload::GetSessions(
+            proto::GetSessions::default(),
+        )),
+    
+        ..Default::default()
+    })));
     // If the relay produced events hbbs never observed, ask it to replay them
     // so the aggregated event stream stays complete across reconnects (see #15).
     if relay_last_event_seq > previous_event_seq {
-        let _ = tx.send(Message::Text(
-            json!({"type": "replay_events", "from_seq": previous_event_seq + 1}).to_string(),
-        ));
+        let _ = tx.send(Message::Binary(encode(&proto::ControlMessage {
+            payload: Some(proto::control_message::Payload::ReplayEvents(
+                proto::ReplayEvents {
+                    from_seq: previous_event_seq + 1,
+                    ..Default::default()
+                },
+            )),
+        
+        ..Default::default()
+    })));
     }
 
     loop {
         tokio::select! {
             inbound = socket.recv() => {
                 match inbound {
-                    Some(Ok(Message::Text(text))) => {
-                        handle_control_message(&relay_id, generation, &text);
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if let Ok(msg) = proto::ControlMessage::parse_from_bytes(&bytes) {
+                            handle_control_message(&relay_id, generation, &msg);
+                        }
                     }
                     Some(Ok(_)) => {}
                     _ => break,
@@ -1155,10 +1270,7 @@ async fn control_socket(mut socket: WebSocket) {
     }
 }
 
-fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
-    let Ok(message) = serde_json::from_str::<Value>(text) else {
-        return;
-    };
+fn handle_control_message(relay_id: &str, generation: u64, message: &proto::ControlMessage) {
     let mut relays = RELAYS.write().unwrap();
     let Some(relay) = relays.get_mut(relay_id) else {
         return;
@@ -1166,74 +1278,67 @@ fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
     if relay.generation != generation {
         return;
     }
-    match message["type"].as_str() {
-        Some("heartbeat") => {
+    match &message.payload {
+        Some(proto::control_message::Payload::Heartbeat(hb)) => {
             relay.last_heartbeat = Instant::now();
             // Persist the most recent host stats so the relays API can expose
             // load/capacity between heartbeats (see #1).
-            if !message["stats"].is_null() {
-                relay.stats = message["stats"].clone();
+            if let Some(stats) = hb.stats.as_ref() {
+                relay.stats = stats_from_proto(stats);
             }
         }
-        Some("sessions") => {
-            if let Some(data) = message["data"].as_array() {
-                relay.sessions = data.clone();
-            }
+        Some(proto::control_message::Payload::Sessions(snap)) => {
+            relay.sessions = snap.sessions.iter().map(session_from_proto).collect();
         }
-        Some("event") => {
+        Some(proto::control_message::Payload::Event(ev)) => {
             // Only accept sequenced events that advance the contiguous observed
-            // cursor; replayed older events (seq <= cursor) are duplicates and
-            // must not move the cursor backward or be republished (see #15).
-            // Events without a seq (legacy relays) are always accepted.
-            let accept = match message["seq"].as_u64() {
-                Some(seq) => {
-                    let cursor = RELAY_EVENT_CURSORS
-                        .read()
+            // cursor; replayed older events (seq <= cursor) are duplicates.
+            // seq == 0 means unsequenced (legacy) and is always accepted.
+            let seq = ev.seq;
+            let accept = if seq > 0 {
+                let cursor = RELAY_EVENT_CURSORS
+                    .read()
+                    .unwrap()
+                    .get(relay_id)
+                    .copied()
+                    .unwrap_or(0);
+                if seq > cursor {
+                    RELAY_EVENT_CURSORS
+                        .write()
                         .unwrap()
-                        .get(relay_id)
-                        .copied()
-                        .unwrap_or(0);
-                    if seq > cursor {
-                        RELAY_EVENT_CURSORS
-                            .write()
-                            .unwrap()
-                            .insert(relay_id.to_owned(), seq);
-                        relay.last_event_seq = seq;
-                        true
-                    } else {
-                        false
-                    }
+                        .insert(relay_id.to_owned(), seq);
+                    relay.last_event_seq = seq;
+                    true
+                } else {
+                    false
                 }
-                None => true,
+            } else {
+                true
             };
             if accept {
-                let mut event = message["event"].clone();
-                if let Some(object) = event.as_object_mut() {
-                    object.insert("relay_id".to_owned(), json!(relay_id));
+                let kind_str = match ev.kind.enum_value_or_default() {
+                    proto::session_event::Kind::SESSION_OPENED => "session_opened",
+                    proto::session_event::Kind::SESSION_CLOSED => "session_closed",
+                };
+                let mut data = json!({"kind": kind_str, "uuid": ev.uuid, "relay_id": relay_id});
+                if let Some(session) = ev.session.as_ref() {
+                    data["session"] = session_from_proto(session);
                 }
-                if event["kind"].as_str() == Some("session_opened") {
+                if kind_str == "session_opened" {
                     relay.last_heartbeat = Instant::now();
                 }
-                let kind = event["kind"].as_str().unwrap_or("relay_event").to_owned();
-                emit_event(&kind, event);
+                emit_event(kind_str, data);
             }
         }
-        Some("response") => {
-            // Complete the pending proxy request awaiting this exchange. Ban
-            // acknowledgements use the separate "ban_ack" type so their numeric
-            // id can never collide with a proxy request id (see #9).
-            if let Some(id) = message["id"].as_u64() {
-                if let Some(pending) = RELAY_REQUESTS.lock().unwrap().remove(&id) {
-                    let _ = pending.responder.send(message);
-                }
+        Some(proto::control_message::Payload::Response(resp)) => {
+            // Complete the pending proxy request awaiting this exchange.
+            if let Some(pending) = RELAY_REQUESTS.lock().unwrap().remove(&resp.id) {
+                let _ = pending.responder.send(resp.clone());
             }
         }
-        Some("ban_ack") => {
-            // Ban policy acknowledgement: record the applied sequence so hbbs
-            // can track per-relay policy consistency (see #9).
-            if let Some(id) = message["id"].as_u64() {
-                relay.last_bans_seq = id;
-            }
+        Some(proto::control_message::Payload::BanAck(ack)) => {
+            // Ban policy acknowledgement: record the applied sequence (see #9).
+            relay.last_bans_seq = ack.id;
         }
         _ => {}
     }
@@ -1290,7 +1395,20 @@ async fn relay_disconnect(
     }
     // Correlate via relay_request so the HTTP client learns whether the
     // relay actually applied the disconnect instead of fire-and-forget (see #9).
-    relay_response(relay_request(&relay_id, json!({"type": "disconnect", "uuid": uuid})).await)
+    relay_response(
+        relay_request(&relay_id, |id| proto::ControlMessage {
+            payload: Some(proto::control_message::Payload::Disconnect(
+                proto::Disconnect {
+                    id,
+                    uuid: uuid.clone(),
+                    ..Default::default()
+                },
+            )),
+        
+        ..Default::default()
+    })
+        .await,
+    )
 }
 
 fn relay_available(relay_id: &str) -> bool {
@@ -1299,14 +1417,13 @@ fn relay_available(relay_id: &str) -> bool {
 
 // The relay answered with an HTTP-equivalent status and body; forward both so
 // the proxy endpoints keep the semantics of the direct ones.
-fn relay_response(result: ResultType<Value>) -> Response {
+fn relay_response(result: ResultType<proto::ControlResponse>) -> Response {
     match result {
-        Ok(response) => {
-            let status = response["status"]
-                .as_u64()
-                .and_then(|code| StatusCode::from_u16(code as u16).ok())
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status as u16)
                 .unwrap_or(StatusCode::BAD_GATEWAY);
-            (status, Json(response["body"].clone())).into_response()
+            let body: Value = serde_json::from_slice(&resp.body).unwrap_or_else(|_| json!({}));
+            (status, Json(body)).into_response()
         }
         Err(err) => (
             StatusCode::BAD_GATEWAY,
@@ -1325,7 +1442,19 @@ async fn relay_config(
     if state.service != "hbbs" || !relay_available(&relay_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    relay_response(relay_request(&relay_id, json!({"type": "get_config"})).await)
+    relay_response(
+        relay_request(&relay_id, |id| proto::ControlMessage {
+            payload: Some(proto::control_message::Payload::GetConfig(
+                proto::GetConfig {
+                    id,
+                    ..Default::default()
+                },
+            )),
+        
+        ..Default::default()
+    })
+        .await,
+    )
 }
 
 async fn relay_replace_config(
@@ -1337,10 +1466,17 @@ async fn relay_replace_config(
         return StatusCode::NOT_FOUND.into_response();
     }
     relay_response(
-        relay_request(
-            &relay_id,
-            json!({"type": "set_config", "values": update.values}),
-        )
+        relay_request(&relay_id, |id| proto::ControlMessage {
+            payload: Some(proto::control_message::Payload::SetConfig(
+                proto::SetConfig {
+                    id,
+                    values: update.values.into_iter().collect(),
+                    ..Default::default()
+                },
+            )),
+        
+        ..Default::default()
+    })
         .await,
     )
 }
@@ -1354,7 +1490,20 @@ async fn relay_logs(
         return StatusCode::NOT_FOUND.into_response();
     }
     let tail = query.tail.unwrap_or(200).min(LOG_CAPACITY);
-    relay_response(relay_request(&relay_id, json!({"type": "get_logs", "tail": tail})).await)
+    relay_response(
+        relay_request(&relay_id, |id| proto::ControlMessage {
+            payload: Some(proto::control_message::Payload::GetLogs(
+                proto::GetLogs {
+                    id,
+                    tail: tail as u64,
+                    ..Default::default()
+                },
+            )),
+        
+        ..Default::default()
+    })
+        .await,
+    )
 }
 
 // Restart is acknowledged before the relay exits: the relay sends the response
@@ -1367,7 +1516,19 @@ async fn relay_restart(
     if state.service != "hbbs" || !relay_available(&relay_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    relay_response(relay_request(&relay_id, json!({"type": "restart"})).await)
+    relay_response(
+        relay_request(&relay_id, |id| proto::ControlMessage {
+            payload: Some(proto::control_message::Payload::Restart(
+                proto::Restart {
+                    id,
+                    ..Default::default()
+                },
+            )),
+        
+        ..Default::default()
+    })
+        .await,
+    )
 }
 
 // Aggregated server-sent event stream: peer online/offline, relay session
@@ -1763,12 +1924,18 @@ mod tests {
             .recv()
             .await
             .expect("the relay must receive the active policy");
-        let Message::Text(text) = message else {
-            panic!("expected a text message");
+        let Message::Binary(bytes) = message else {
+            panic!("expected a binary message");
         };
-        let payload: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(payload["type"], "bans");
-        assert_eq!(payload["bans"]["device_ids"][0], "fanout-device");
+        let payload = proto::ControlMessage::parse_from_bytes(&bytes).unwrap();
+        let bans = match payload.payload {
+            Some(proto::control_message::Payload::Bans(b)) => b,
+            _ => panic!("expected a bans update"),
+        };
+        assert_eq!(
+            bans.bans.as_ref().unwrap().device_ids[0],
+            "fanout-device"
+        );
         clear_relays();
         drop(fixture);
     }
@@ -1778,20 +1945,38 @@ mod tests {
         let _test = POLICY_TEST.lock().unwrap();
         // Events emitted before any consumer registered are dropped instead
         // of piling up in the unbounded channel.
-        control_emit(json!({"type": "event", "dropped": 1}));
+        control_emit(proto::SessionEvent {
+            kind: proto::session_event::Kind::SESSION_OPENED.into(),
+            uuid: "dropped".to_owned(),
+            ..Default::default()
+        });
         let mut receiver = take_control_receiver().expect("first take returns the receiver");
         assert!(
             receiver.try_recv().is_err(),
             "events without a consumer must be dropped"
         );
-        control_emit(json!({"type": "event", "kept": 2}));
-        assert_eq!(receiver.try_recv().unwrap()["kept"], 2);
+        control_emit(proto::SessionEvent {
+            kind: proto::session_event::Kind::SESSION_OPENED.into(),
+            uuid: "kept-2".to_owned(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            Some(proto::control_message::Payload::Event(_))
+        ));
         assert!(
             take_control_receiver().is_none(),
             "the receiver is handed out exactly once"
         );
-        control_emit(json!({"type": "event", "kept": 3}));
-        assert_eq!(receiver.try_recv().unwrap()["kept"], 3);
+        control_emit(proto::SessionEvent {
+            kind: proto::session_event::Kind::SESSION_OPENED.into(),
+            uuid: "kept-3".to_owned(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            Some(proto::control_message::Payload::Event(_))
+        ));
     }
 
     #[test]
@@ -1818,7 +2003,16 @@ mod tests {
             },
         );
         let mut events = subscribe_events();
-        handle_control_message("relay-b", generation, r#"{"type":"heartbeat"}"#);
+        handle_control_message(
+            "relay-b",
+            generation,
+            &proto::ControlMessage {
+                payload: Some(proto::control_message::Payload::Heartbeat(
+                    proto::Heartbeat::default(),
+                )),
+                ..Default::default()
+            },
+        );
         assert!(
             RELAYS.read().unwrap()["relay-b"]
                 .last_heartbeat
@@ -1830,20 +2024,48 @@ mod tests {
         handle_control_message(
             "relay-b",
             generation,
-            r#"{"type":"sessions","data":[{"uuid":"session-1"}]}"#,
+            &proto::ControlMessage {
+                payload: Some(proto::control_message::Payload::Sessions(
+                    proto::SessionsSnapshot {
+                        sessions: vec![proto::SessionInfo {
+                            uuid: "session-1".to_owned(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
         );
         assert_eq!(RELAYS.read().unwrap()["relay-b"].sessions.len(), 1);
         // Stale generations are ignored so old sockets cannot corrupt state.
         handle_control_message(
             "relay-b",
             generation + 1,
-            r#"{"type":"sessions","data":[]}"#,
+            &proto::ControlMessage {
+                payload: Some(proto::control_message::Payload::Sessions(
+                    proto::SessionsSnapshot::default(),
+                )),
+                ..Default::default()
+            },
         );
         assert_eq!(RELAYS.read().unwrap()["relay-b"].sessions.len(), 1);
         handle_control_message(
             "relay-b",
             generation,
-            r#"{"type":"event","event":{"kind":"session_opened","session":{"uuid":"session-1"}}}"#,
+            &proto::ControlMessage {
+                payload: Some(proto::control_message::Payload::Event(proto::SessionEvent {
+                    kind: proto::session_event::Kind::SESSION_OPENED.into(),
+                    uuid: "session-1".to_owned(),
+                    session: Some(proto::SessionInfo {
+                        uuid: "session-1".to_owned(),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
         );
         // The event bus is shared; wait for our own event instead of
         // assuming it is the next one on the channel.
@@ -2121,30 +2343,44 @@ mod tests {
         // an HTTP-equivalent status and body through the control socket loop.
         let responder = tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
-                let Message::Text(text) = message else {
+                let Message::Binary(bytes) = message else {
                     continue;
                 };
-                let payload: Value = serde_json::from_str(&text).unwrap();
-                let kind = payload["type"].as_str().unwrap().to_owned();
-                let _ = seen_tx.send(kind.clone());
-                let id = payload["id"].clone();
-                let response = match kind.as_str() {
-                    "get_config" => json!({"type":"response","id":id,"status":200,
-                        "body":{"values":{"limit-speed":"64"}}}),
-                    "get_logs" => json!({"type":"response","id":id,"status":200,
-                        "body":{"data":["relay-log-line"]}}),
-                    "set_config" => json!({"type":"response","id":id,"status":400,
-                        "body":{"error":"invalid value"}}),
-                    "restart" => {
-                        // The relay acknowledges restart before exiting.
-                        let response = json!({"type":"response","id":id,"status":202,
-                            "body":{"state":"restarting"}});
-                        handle_control_message("relay-c", generation, &response.to_string());
-                        break;
-                    }
+                let payload = proto::ControlMessage::parse_from_bytes(&bytes).unwrap();
+                let (kind, id) = match &payload.payload {
+                    Some(proto::control_message::Payload::GetConfig(g)) => ("get_config", g.id),
+                    Some(proto::control_message::Payload::GetLogs(gl)) => ("get_logs", gl.id),
+                    Some(proto::control_message::Payload::SetConfig(sc)) => ("set_config", sc.id),
+                    Some(proto::control_message::Payload::Restart(r)) => ("restart", r.id),
+                    Some(proto::control_message::Payload::Disconnect(d)) => ("disconnect", d.id),
                     _ => continue,
                 };
-                handle_control_message("relay-c", generation, &response.to_string());
+                let _ = seen_tx.send(kind.to_owned());
+                let (status, body) = match kind {
+                    "get_config" => (200u32, json!({"values":{"limit-speed":"64"}})),
+                    "get_logs" => (200, json!({"data":["relay-log-line"]})),
+                    "set_config" => (400, json!({"error":"invalid value"})),
+                    "restart" => (202, json!({"state":"restarting"})),
+                    "disconnect" => (200, json!({"applied":true})),
+                    _ => (200, json!({})),
+                };
+                let response = proto::ControlMessage {
+                    payload: Some(proto::control_message::Payload::Response(
+                        proto::ControlResponse {
+                            id,
+                            status,
+                            body: serde_json::to_vec(&body).unwrap().into(),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                };
+                if kind == "restart" {
+                    // The relay acknowledges restart before exiting.
+                    handle_control_message("relay-c", generation, &response);
+                    break;
+                }
+                handle_control_message("relay-c", generation, &response);
             }
         });
         let response = relay_config(Extension(state.clone()), Path("relay-c".to_owned())).await;
