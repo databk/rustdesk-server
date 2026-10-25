@@ -127,6 +127,86 @@ fn normalize_control_url(value: &str) -> ResultType<String> {
     Ok(url.into())
 }
 
+// Optional capacity cap advertised in heartbeats so hbbs can avoid selecting a
+// relay that is already at its limit. Unset means "no configured limit".
+fn max_sessions() -> Option<u64> {
+    std::env::var("RD_MAX_SESSIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+// Lightweight host stats for heartbeat reporting. Reads /proc on Linux and
+// degrades gracefully (returns None) on other platforms, so no new dependency
+// is required and the relay stays cross-platform.
+#[cfg(target_os = "linux")]
+mod sys_stats {
+    use std::sync::Mutex;
+
+    static LAST_CPU: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+    pub fn cpu_usage() -> Option<f32> {
+        let contents = std::fs::read_to_string("/proc/stat").ok()?;
+        let first = contents.lines().next()?;
+        let mut fields = first.split_whitespace();
+        if fields.next()? != "cpu" {
+            return None;
+        }
+        let nums: Vec<u64> = fields.filter_map(|s| s.parse().ok()).collect();
+        if nums.len() < 4 {
+            return None;
+        }
+        let idle = nums[3];
+        let total: u64 = nums.iter().sum();
+        let mut last = LAST_CPU.lock().ok()?;
+        let usage = match *last {
+            Some((prev_idle, prev_total)) => {
+                let d_idle = idle.saturating_sub(prev_idle);
+                let d_total = total.saturating_sub(prev_total);
+                if d_total > 0 {
+                    Some(((d_total - d_idle) as f32 / d_total as f32) * 100.0)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        *last = Some((idle, total));
+        usage
+    }
+
+    pub fn mem_usage() -> Option<f32> {
+        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let mut total: Option<u64> = None;
+        let mut available: Option<u64> = None;
+        for line in contents.lines() {
+            let mut parts = line.split_whitespace();
+            let key = parts.next()?;
+            let value: u64 = parts.next().and_then(|v| v.parse().ok())?;
+            match key {
+                "MemTotal:" => total = Some(value),
+                "MemAvailable:" => available = Some(value),
+                _ => {}
+            }
+        }
+        let (total, available) = (total?, available?);
+        if total > 0 {
+            Some(((total.saturating_sub(available)) as f32 / total as f32) * 100.0)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod sys_stats {
+    pub fn cpu_usage() -> Option<f32> {
+        None
+    }
+    pub fn mem_usage() -> Option<f32> {
+        None
+    }
+}
+
 // The relay id identifies the node; the advertised address is optional.
 // Without RD_RELAY_ADDRESS no address is reported: the id (often a container
 // hostname) is not resolvable by clients and must not be broadcast as a relay
@@ -165,7 +245,10 @@ async fn run(
         "relay": {
             "id": id,
             "version": crate::version::VERSION,
-        }
+        },
+        // Tell hbbs the highest event sequence the relay has produced so a
+        // reconnect can request replay of anything hbbs missed (see #15).
+        "last_event_seq": management::last_event_seq(),
     });
     if let Some(address) = &address {
         register["relay"]["address"] = json!(address);
@@ -187,14 +270,28 @@ async fn run_registered(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                let beat = json!({
-                    "type": "heartbeat",
-                    "uptime_seconds": started.elapsed().as_secs(),
-                });
-                socket.send(Message::Text(beat.to_string())).await?;
                 // Traffic counters only change inside hbbr; without a periodic
                 // snapshot hbbs keeps the values from session_opened (0 bytes).
                 let sessions = management::sessions_snapshot();
+                let bytes_per_second: u64 = sessions
+                    .iter()
+                    .filter_map(|s| s["bytes_per_second"].as_u64())
+                    .sum();
+                let mut stats = json!({
+                    "cpu_usage": sys_stats::cpu_usage(),
+                    "mem_usage": sys_stats::mem_usage(),
+                    "active_sessions": sessions.len() as u64,
+                    "bytes_per_second": bytes_per_second,
+                });
+                if let Some(max) = max_sessions() {
+                    stats["max_sessions"] = json!(max);
+                }
+                let beat = json!({
+                    "type": "heartbeat",
+                    "uptime_seconds": started.elapsed().as_secs(),
+                    "stats": stats,
+                });
+                socket.send(Message::Text(beat.to_string())).await?;
                 if !sessions.is_empty() {
                     let snapshot = json!({
                         "type": "sessions",
@@ -253,6 +350,13 @@ async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()
             // The aggregating hbbs owns the policy; relay-side persistence keeps
             // the policy active across relay restarts even if hbbs is down.
             management::apply_bans_update("hbbr", bans).await?;
+            // Acknowledge with a dedicated ban_ack type so hbbs can track which
+            // relays have applied the current policy sequence without colliding
+            // with proxy request ids (see #9).
+            if !id.is_null() {
+                let ack = json!({"type": "ban_ack", "id": id});
+                socket.send(Message::Text(ack.to_string())).await?;
+            }
         }
         Some("get_sessions") => {
             let snapshot = json!({
@@ -262,8 +366,26 @@ async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()
             socket.send(Message::Text(snapshot.to_string())).await?;
         }
         Some("disconnect") => {
-            if let Some(uuid) = message["uuid"].as_str() {
-                management::disconnect_session(uuid);
+            let applied = if let Some(uuid) = message["uuid"].as_str() {
+                management::disconnect_session(uuid)
+            } else {
+                false
+            };
+            // Acknowledge correlated disconnect requests so hbbs HTTP handlers
+            // can confirm execution instead of fire-and-forget (see #9).
+            if !id.is_null() {
+                respond(socket, &id, 200, json!({"applied": applied})).await?;
+            }
+        }
+        Some("replay_events") => {
+            // hbbs asks the relay to re-send events hbbs missed during a
+            // reconnect gap; each replayed event keeps its original seq (see #15).
+            let from_seq = message["from_seq"].as_u64().unwrap_or(0);
+            for event in management::replay_events_since(from_seq) {
+                socket.send(Message::Text(event.to_string())).await?;
+            }
+            if !id.is_null() {
+                respond(socket, &id, 200, json!({"replayed": true})).await?;
             }
         }
         // The remaining commands are proxied management requests: hbbs
