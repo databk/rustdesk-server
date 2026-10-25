@@ -612,13 +612,28 @@ mod tests {
             )
             .await
             .unwrap();
-            let registration = socket.next().await.unwrap().unwrap().into_text().unwrap();
-            let registration: Value = serde_json::from_str(&registration).unwrap();
-            assert_eq!(registration["type"], "register");
-            assert!(registration["relay"]["id"].is_string());
-            let heartbeat = socket.next().await.unwrap().unwrap().into_text().unwrap();
-            let heartbeat: Value = serde_json::from_str(&heartbeat).unwrap();
-            assert_eq!(heartbeat["type"], "heartbeat");
+            let registration = socket.next().await.unwrap().unwrap();
+            let registration_bytes = match registration {
+                Message::Binary(b) => b,
+                _ => panic!("expected a binary registration frame"),
+            };
+            let registration =
+                proto::ControlMessage::parse_from_bytes(&registration_bytes).unwrap();
+            assert!(matches!(
+                registration.payload,
+                Some(proto::control_message::Payload::Register(_))
+            ));
+            let heartbeat = socket.next().await.unwrap().unwrap();
+            let heartbeat_bytes = match heartbeat {
+                Message::Binary(b) => b,
+                _ => panic!("expected a binary heartbeat frame"),
+            };
+            let heartbeat =
+                proto::ControlMessage::parse_from_bytes(&heartbeat_bytes).unwrap();
+            assert!(matches!(
+                heartbeat.payload,
+                Some(proto::control_message::Payload::Heartbeat(_))
+            ));
             socket.close(None).await.unwrap();
             while let Some(message) = socket.next().await {
                 if message.unwrap().is_close() {
