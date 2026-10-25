@@ -106,6 +106,13 @@ struct RelayConnection {
     started: Instant,
     last_heartbeat: Instant,
     sessions: Vec<Value>,
+    // Most recent host stats reported in the heartbeat (see #1).
+    stats: Value,
+    // Highest event sequence observed from this relay; used to detect a
+    // reconnect gap and request replay (see #15).
+    last_event_seq: u64,
+    // Most recent ban policy sequence the relay acknowledged (see #9).
+    last_bans_seq: u64,
     tx: mpsc::UnboundedSender<Message>,
 }
 
@@ -157,8 +164,13 @@ fn relay_command(relay_id: &str, payload: Value) -> ResultType<()> {
     Ok(())
 }
 
+// Monotonic sequence stamped onto every ban policy fanout so relays can
+// acknowledge application and hbbs can track per-relay consistency (see #9).
+static BANS_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn fanout_bans() {
-    let payload = json!({"type": "bans", "bans": *BANS.read().unwrap()});
+    let seq = BANS_SEQ.load(Ordering::SeqCst);
+    let payload = json!({"type": "bans", "id": seq, "bans": *BANS.read().unwrap()});
     let text = payload.to_string();
     for relay in RELAYS.read().unwrap().values() {
         let _ = relay.tx.send(Message::Text(text.clone()));
@@ -229,10 +241,51 @@ static CONTROL_OUT: Lazy<(
 });
 static CONTROL_CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+// Monotonic sequence stamped onto every relay-side event (session_opened /
+// session_closed) plus a bounded ring buffer of recent events. On reconnect
+// hbbs can ask the relay to replay events hbbs missed by sending replay_events
+// with the next expected sequence (see #15).
+static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
+static EVENT_BUFFER: Lazy<RwLock<VecDeque<Value>>> = Lazy::new(|| RwLock::new(VecDeque::new()));
+const EVENT_BUFFER_CAPACITY: usize = 1024;
+
 fn control_emit(event: Value) {
     if CONTROL_CONSUMED.load(std::sync::atomic::Ordering::Relaxed) {
-        let _ = CONTROL_OUT.0.send(event);
+        let seq = EVENT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut message = event;
+        message["seq"] = json!(seq);
+        {
+            let mut buffer = EVENT_BUFFER.write().unwrap();
+            buffer.push_back(message.clone());
+            while buffer.len() > EVENT_BUFFER_CAPACITY {
+                buffer.pop_front();
+            }
+        }
+        let _ = CONTROL_OUT.0.send(message);
     }
+}
+
+// Highest event sequence the relay has produced. Sent in register so hbbs can
+// detect a gap after reconnect and request replay.
+pub fn last_event_seq() -> u64 {
+    EVENT_SEQ.load(Ordering::SeqCst)
+}
+
+// Returns buffered events with sequence numbers >= from_seq, oldest first.
+// If the gap predates the buffer the replay is partial; hbbs learns the
+// oldest available sequence from the returned events themselves.
+pub fn replay_events_since(from_seq: u64) -> Vec<Value> {
+    EVENT_BUFFER
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            event["seq"]
+                .as_u64()
+                .map_or(false, |seq| seq >= from_seq)
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn take_control_receiver() -> Option<mpsc::UnboundedReceiver<Value>> {
@@ -815,6 +868,7 @@ async fn replace_bans(
     match result {
         Ok(Ok(())) => {
             if service == "hbbs" {
+                BANS_SEQ.fetch_add(1, Ordering::SeqCst);
                 fanout_bans();
             }
             emit_event("bans_replaced", json!({"service": service}));
@@ -970,8 +1024,18 @@ async fn control_socket(mut socket: WebSocket) {
         .unwrap_or_default()
         .to_owned();
     let info = register["relay"].clone();
+    let relay_last_event_seq = register["last_event_seq"].as_u64().unwrap_or(0);
     let generation = RELAY_GENERATION.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    // Capture the previous connection's last observed event sequence before
+    // replacing it, so a reconnect can request replay of the gap (see #15).
+    let previous_event_seq = {
+        let relays = RELAYS.read().unwrap();
+        relays
+            .get(&relay_id)
+            .map(|relay| relay.last_event_seq)
+            .unwrap_or(0)
+    };
     {
         // A re-registering relay replaces its previous connection; the stale
         // generation prevents the old socket task from clearing the new entry.
@@ -990,6 +1054,9 @@ async fn control_socket(mut socket: WebSocket) {
                 started: Instant::now(),
                 last_heartbeat: Instant::now(),
                 sessions: Vec::new(),
+                stats: Value::Null,
+                last_event_seq: previous_event_seq,
+                last_bans_seq: 0,
                 tx: tx.clone(),
             },
         );
@@ -1002,10 +1069,18 @@ async fn control_socket(mut socket: WebSocket) {
     sync_relay_list();
     // Bring the new relay up to date with the active policy and request a
     // session snapshot so aggregation is complete right after registration.
+    let bans_seq = BANS_SEQ.load(Ordering::SeqCst);
     let _ = tx.send(Message::Text(
-        json!({"type": "bans", "bans": *BANS.read().unwrap()}).to_string(),
+        json!({"type": "bans", "id": bans_seq, "bans": *BANS.read().unwrap()}).to_string(),
     ));
     let _ = tx.send(Message::Text(json!({"type": "get_sessions"}).to_string()));
+    // If the relay produced events hbbs never observed, ask it to replay them
+    // so the aggregated event stream stays complete across reconnects (see #15).
+    if relay_last_event_seq > previous_event_seq {
+        let _ = tx.send(Message::Text(
+            json!({"type": "replay_events", "from_seq": previous_event_seq + 1}).to_string(),
+        ));
+    }
 
     loop {
         tokio::select! {
@@ -1081,6 +1156,11 @@ fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
     match message["type"].as_str() {
         Some("heartbeat") => {
             relay.last_heartbeat = Instant::now();
+            // Persist the most recent host stats so the relays API can expose
+            // load/capacity between heartbeats (see #1).
+            if !message["stats"].is_null() {
+                relay.stats = message["stats"].clone();
+            }
         }
         Some("sessions") => {
             if let Some(data) = message["data"].as_array() {
@@ -1088,6 +1168,10 @@ fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
             }
         }
         Some("event") => {
+            // Track the highest observed sequence for reconnect replay (see #15).
+            if let Some(seq) = message["seq"].as_u64() {
+                relay.last_event_seq = seq;
+            }
             // Relay-reported events join the aggregated event stream.
             let mut event = message["event"].clone();
             if let Some(object) = event.as_object_mut() {
@@ -1102,8 +1186,13 @@ fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
         Some("response") => {
             // Complete the pending relay_request awaiting this exchange.
             if let Some(id) = message["id"].as_u64() {
-                if let Some(pending) = RELAY_REQUESTS.lock().unwrap().remove(&id) {
+                let pending = RELAY_REQUESTS.lock().unwrap().remove(&id);
+                if let Some(pending) = pending {
                     let _ = pending.responder.send(message);
+                } else {
+                    // No pending proxy request: treat as a ban policy ack so
+                    // hbbs can track per-relay policy consistency (see #9).
+                    relay.last_bans_seq = id;
                 }
             }
         }
@@ -1129,6 +1218,9 @@ async fn relays(Extension(state): Extension<ApiState>) -> Response {
                 "uptime_seconds": relay.started.elapsed().as_secs(),
                 "last_heartbeat_age_seconds": relay.last_heartbeat.elapsed().as_secs(),
                 "sessions_count": relay.sessions.len(),
+                "stats": relay.stats,
+                "last_event_seq": relay.last_event_seq,
+                "last_bans_seq": relay.last_bans_seq,
             })
         })
         .collect();
@@ -1154,13 +1246,12 @@ async fn relay_disconnect(
     Extension(state): Extension<ApiState>,
     Path((relay_id, uuid)): Path<(String, String)>,
 ) -> Response {
-    if state.service != "hbbs" {
+    if state.service != "hbbs" || !relay_available(&relay_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match relay_command(&relay_id, json!({"type": "disconnect", "uuid": uuid})) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"closing"}))).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
+    // Correlate via relay_request so the HTTP client learns whether the
+    // relay actually applied the disconnect instead of fire-and-forget (see #9).
+    relay_response(relay_request(&relay_id, json!({"type": "disconnect", "uuid": uuid})).await)
 }
 
 fn relay_available(relay_id: &str) -> bool {
@@ -1227,19 +1318,17 @@ async fn relay_logs(
     relay_response(relay_request(&relay_id, json!({"type": "get_logs", "tail": tail})).await)
 }
 
-// Restart is fire-and-forget: the relay exits right after acknowledging, so
-// there is no stable connection left to answer a correlated request.
+// Restart is acknowledged before the relay exits: the relay sends the response
+// first and then schedules the exit 250ms later, so the correlated exchange
+// completes while the control channel is still up (see #9).
 async fn relay_restart(
     Extension(state): Extension<ApiState>,
     Path(relay_id): Path<String>,
 ) -> Response {
-    if state.service != "hbbs" {
+    if state.service != "hbbs" || !relay_available(&relay_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match relay_command(&relay_id, json!({"type": "restart"})) {
-        Ok(()) => (StatusCode::ACCEPTED, Json(json!({"state":"restarting"}))).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
+    relay_response(relay_request(&relay_id, json!({"type": "restart"})).await)
 }
 
 // Aggregated server-sent event stream: peer online/offline, relay session
@@ -1563,6 +1652,9 @@ mod tests {
                 started: Instant::now(),
                 last_heartbeat: Instant::now(),
                 sessions: Vec::new(),
+                stats: Value::Null,
+                last_event_seq: 0,
+                last_bans_seq: 0,
                 tx,
             },
         );
@@ -1680,6 +1772,9 @@ mod tests {
                 started: Instant::now(),
                 last_heartbeat: Instant::now() - Duration::from_secs(120),
                 sessions: Vec::new(),
+                stats: Value::Null,
+                last_event_seq: 0,
+                last_bans_seq: 0,
                 tx,
             },
         );
@@ -2001,7 +2096,13 @@ mod tests {
                         "body":{"data":["relay-log-line"]}}),
                     "set_config" => json!({"type":"response","id":id,"status":400,
                         "body":{"error":"invalid value"}}),
-                    "restart" => break,
+                    "restart" => {
+                        // The relay acknowledges restart before exiting.
+                        let response = json!({"type":"response","id":id,"status":202,
+                            "body":{"state":"restarting"}});
+                        handle_control_message("relay-c", generation, &response.to_string());
+                        break;
+                    }
                     _ => continue,
                 };
                 handle_control_message("relay-c", generation, &response.to_string());
@@ -2038,7 +2139,7 @@ mod tests {
             serde_json::from_slice(&hyper::body::to_bytes(response.into_body()).await.unwrap())
                 .unwrap();
         assert_eq!(body["error"], "invalid value");
-        // Restart is fire-and-forget.
+        // Restart is acknowledged with 202 before the relay exits.
         let response = relay_restart(Extension(state.clone()), Path("relay-c".to_owned())).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         for expected in ["get_config", "get_logs", "set_config", "restart"] {
@@ -2060,5 +2161,57 @@ mod tests {
         );
         cancel_relay_requests("relay-y");
         assert!(waiter.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn heartbeat_stats_are_persisted_on_relay() {
+        let _test = POLICY_TEST.lock().unwrap();
+        clear_relays();
+        let _rx = register_test_relay("relay-stats", None);
+        let generation = RELAYS.read().unwrap()["relay-stats"].generation;
+        handle_control_message(
+            "relay-stats",
+            generation,
+            r#"{"type":"heartbeat","stats":{"cpu_usage":12.5,"active_sessions":3}}"#,
+        );
+        let relays = RELAYS.read().unwrap();
+        assert_eq!(relays["relay-stats"].stats["cpu_usage"], 12.5);
+        assert_eq!(relays["relay-stats"].stats["active_sessions"], 3);
+        clear_relays();
+    }
+
+    #[test]
+    fn ban_ack_updates_last_bans_seq_when_no_pending_request() {
+        let _test = POLICY_TEST.lock().unwrap();
+        clear_relays();
+        let _rx = register_test_relay("relay-ack", None);
+        let generation = RELAYS.read().unwrap()["relay-ack"].generation;
+        // A response with no matching pending proxy request is treated as a
+        // ban policy acknowledgement and records the applied sequence (see #9).
+        handle_control_message(
+            "relay-ack",
+            generation,
+            r#"{"type":"response","id":42,"status":200,"body":{"applied":true}}"#,
+        );
+        assert_eq!(RELAYS.read().unwrap()["relay-ack"].last_bans_seq, 42);
+        clear_relays();
+    }
+
+    #[test]
+    fn event_seq_advances_and_replay_filters_by_sequence() {
+        let _test = POLICY_TEST.lock().unwrap();
+        // Ensure events are enqueued; the receiver may already be consumed by
+        // an earlier test, which is fine because CONTROL_CONSUMED stays true.
+        let _ = take_control_receiver();
+        let before = last_event_seq();
+        control_emit(json!({"type":"event","event":{"kind":"session_opened","uuid":"a"}}));
+        control_emit(json!({"type":"event","event":{"kind":"session_closed","uuid":"a"}}));
+        let after = last_event_seq();
+        assert_eq!(after, before + 2);
+        // Replay only events from the second emission onward (see #15).
+        let replayed = replay_events_since(before + 2);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0]["seq"], before + 2);
+        assert_eq!(replayed[0]["event"]["kind"], "session_closed");
     }
 }
