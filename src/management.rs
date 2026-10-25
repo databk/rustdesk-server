@@ -1316,9 +1316,13 @@ fn handle_control_message(relay_id: &str, generation: u64, message: &proto::Cont
                 true
             };
             if accept {
-                let kind_str = match ev.kind.enum_value_or_default() {
-                    proto::session_event::Kind::SESSION_OPENED => "session_opened",
-                    proto::session_event::Kind::SESSION_CLOSED => "session_closed",
+                let kind_str = match ev.kind.enum_value() {
+                    Ok(proto::session_event::Kind::SESSION_OPENED) => "session_opened",
+                    Ok(proto::session_event::Kind::SESSION_CLOSED) => "session_closed",
+                    _ => {
+                        log::warn!("Relay {relay_id} sent an unknown session event kind");
+                        return;
+                    }
                 };
                 let mut data = json!({"kind": kind_str, "uuid": ev.uuid, "relay_id": relay_id});
                 if let Some(session) = ev.session.as_ref() {
