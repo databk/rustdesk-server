@@ -1,3 +1,9 @@
+rustdesk-server (1.1.1) UNRELEASED; urgency=medium
+
+  * Upstream release 1.1.1
+
+ -- RustDesk release workflow <noreply@rustdesk.com>  Sun, 25 Oct 2026 03:11:33 +0000
+
 rustdesk-server (1.1.0) UNRELEASED; urgency=medium
 
   * Upstream release 1.1.0

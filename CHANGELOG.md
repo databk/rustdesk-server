@@ -1,3 +1,14 @@
+## [1.1.1](https://github.com/databk/rustdesk-server/compare/1.1.0...1.1.1) (2026-10-25)
+
+
+### Bug Fixes
+
+* **ci:** replace broken docker-manifest-action with buildx imagetools ([#68](https://github.com/databk/rustdesk-server/issues/68)) ([5f61b04](https://github.com/databk/rustdesk-server/commit/5f61b04ebc10c5237daa186b3e2c6b8432313286))
+* **hbbr:** normalize and validate management control URLs ([#73](https://github.com/databk/rustdesk-server/issues/73)) ([cd8538e](https://github.com/databk/rustdesk-server/commit/cd8538e8289d9b15db321a7e308012b521841dbf))
+* **hbbr:** reject port 0 and empty port in control URL validation ([#75](https://github.com/databk/rustdesk-server/issues/75)) ([9a74649](https://github.com/databk/rustdesk-server/commit/9a74649bf85932c877fa8591c7d9fe5825e63af3)), closes [databk/rustdesk-server#73](https://github.com/databk/rustdesk-server/issues/73)
+
+
+
 # [1.1.0](https://github.com/databk/rustdesk-server/compare/1.0.1...1.1.0) (2026-10-18)
 
 
