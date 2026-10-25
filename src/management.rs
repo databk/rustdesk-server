@@ -249,17 +249,25 @@ static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 static EVENT_BUFFER: Lazy<RwLock<VecDeque<Value>>> = Lazy::new(|| RwLock::new(VecDeque::new()));
 const EVENT_BUFFER_CAPACITY: usize = 1024;
 
+// Highest event sequence observed from each relay, kept independently of the
+// live RELAYS entry so the cursor survives disconnects (a control socket close
+// removes the RELAYS row). Reset to 0 when a relay starts a new sequence epoch
+// (reports a last_event_seq below the stored cursor, e.g. after a relay restart).
+static RELAY_EVENT_CURSORS: Lazy<RwLock<HashMap<String, u64>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
 fn control_emit(event: Value) {
     if CONTROL_CONSUMED.load(std::sync::atomic::Ordering::Relaxed) {
+        // Hold the buffer write lock across sequence assignment, buffering and
+        // delivery so concurrent callers cannot assign a later sequence and
+        // send it before an earlier one (see #15).
+        let mut buffer = EVENT_BUFFER.write().unwrap();
         let seq = EVENT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
         let mut message = event;
         message["seq"] = json!(seq);
-        {
-            let mut buffer = EVENT_BUFFER.write().unwrap();
-            buffer.push_back(message.clone());
-            while buffer.len() > EVENT_BUFFER_CAPACITY {
-                buffer.pop_front();
-            }
+        buffer.push_back(message.clone());
+        while buffer.len() > EVENT_BUFFER_CAPACITY {
+            buffer.pop_front();
         }
         let _ = CONTROL_OUT.0.send(message);
     }
@@ -1027,14 +1035,19 @@ async fn control_socket(mut socket: WebSocket) {
     let relay_last_event_seq = register["last_event_seq"].as_u64().unwrap_or(0);
     let generation = RELAY_GENERATION.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    // Capture the previous connection's last observed event sequence before
-    // replacing it, so a reconnect can request replay of the gap (see #15).
+    // Read the observed event cursor from a map that survives control socket
+    // disconnects (the RELAYS row is removed on close). If the relay reports a
+    // last_event_seq below the stored cursor it has started a new sequence epoch
+    // (e.g. after a relay restart), so reset the cursor to 0 and replay nothing.
     let previous_event_seq = {
-        let relays = RELAYS.read().unwrap();
-        relays
-            .get(&relay_id)
-            .map(|relay| relay.last_event_seq)
-            .unwrap_or(0)
+        let mut cursors = RELAY_EVENT_CURSORS.write().unwrap();
+        let stored = cursors.get(&relay_id).copied().unwrap_or(0);
+        if relay_last_event_seq < stored {
+            cursors.insert(relay_id.clone(), 0);
+            0
+        } else {
+            stored
+        }
     };
     {
         // A re-registering relay replaces its previous connection; the stale
@@ -1168,32 +1181,48 @@ fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
             }
         }
         Some("event") => {
-            // Track the highest observed sequence for reconnect replay (see #15).
-            if let Some(seq) = message["seq"].as_u64() {
+            // Only accept events that advance the contiguous observed cursor.
+            // Replayed older events (seq <= cursor) are duplicates and must not
+            // move the cursor backward or be republished (see #15).
+            let seq = message["seq"].as_u64().unwrap_or(0);
+            let cursor = RELAY_EVENT_CURSORS
+                .read()
+                .unwrap()
+                .get(relay_id)
+                .copied()
+                .unwrap_or(0);
+            if seq > cursor {
+                RELAY_EVENT_CURSORS
+                    .write()
+                    .unwrap()
+                    .insert(relay_id.to_owned(), seq);
                 relay.last_event_seq = seq;
+                let mut event = message["event"].clone();
+                if let Some(object) = event.as_object_mut() {
+                    object.insert("relay_id".to_owned(), json!(relay_id));
+                }
+                if event["kind"].as_str() == Some("session_opened") {
+                    relay.last_heartbeat = Instant::now();
+                }
+                let kind = event["kind"].as_str().unwrap_or("relay_event").to_owned();
+                emit_event(&kind, event);
             }
-            // Relay-reported events join the aggregated event stream.
-            let mut event = message["event"].clone();
-            if let Some(object) = event.as_object_mut() {
-                object.insert("relay_id".to_owned(), json!(relay_id));
-            }
-            if event["kind"].as_str() == Some("session_opened") {
-                relay.last_heartbeat = Instant::now();
-            }
-            let kind = event["kind"].as_str().unwrap_or("relay_event").to_owned();
-            emit_event(&kind, event);
         }
         Some("response") => {
-            // Complete the pending relay_request awaiting this exchange.
+            // Complete the pending proxy request awaiting this exchange. Ban
+            // acknowledgements use the separate "ban_ack" type so their numeric
+            // id can never collide with a proxy request id (see #9).
             if let Some(id) = message["id"].as_u64() {
-                let pending = RELAY_REQUESTS.lock().unwrap().remove(&id);
-                if let Some(pending) = pending {
+                if let Some(pending) = RELAY_REQUESTS.lock().unwrap().remove(&id) {
                     let _ = pending.responder.send(message);
-                } else {
-                    // No pending proxy request: treat as a ban policy ack so
-                    // hbbs can track per-relay policy consistency (see #9).
-                    relay.last_bans_seq = id;
                 }
+            }
+        }
+        Some("ban_ack") => {
+            // Ban policy acknowledgement: record the applied sequence so hbbs
+            // can track per-relay policy consistency (see #9).
+            if let Some(id) = message["id"].as_u64() {
+                relay.last_bans_seq = id;
             }
         }
         _ => {}

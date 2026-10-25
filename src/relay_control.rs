@@ -350,10 +350,12 @@ async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()
             // The aggregating hbbs owns the policy; relay-side persistence keeps
             // the policy active across relay restarts even if hbbs is down.
             management::apply_bans_update("hbbr", bans).await?;
-            // Acknowledge so hbbs can track which relays have applied the
-            // current policy sequence (see #9).
+            // Acknowledge with a dedicated ban_ack type so hbbs can track which
+            // relays have applied the current policy sequence without colliding
+            // with proxy request ids (see #9).
             if !id.is_null() {
-                respond(socket, &id, 200, json!({"applied": true})).await?;
+                let ack = json!({"type": "ban_ack", "id": id});
+                socket.send(Message::Text(ack.to_string())).await?;
             }
         }
         Some("get_sessions") => {
