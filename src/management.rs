@@ -1181,22 +1181,32 @@ fn handle_control_message(relay_id: &str, generation: u64, text: &str) {
             }
         }
         Some("event") => {
-            // Only accept events that advance the contiguous observed cursor.
-            // Replayed older events (seq <= cursor) are duplicates and must not
-            // move the cursor backward or be republished (see #15).
-            let seq = message["seq"].as_u64().unwrap_or(0);
-            let cursor = RELAY_EVENT_CURSORS
-                .read()
-                .unwrap()
-                .get(relay_id)
-                .copied()
-                .unwrap_or(0);
-            if seq > cursor {
-                RELAY_EVENT_CURSORS
-                    .write()
-                    .unwrap()
-                    .insert(relay_id.to_owned(), seq);
-                relay.last_event_seq = seq;
+            // Only accept sequenced events that advance the contiguous observed
+            // cursor; replayed older events (seq <= cursor) are duplicates and
+            // must not move the cursor backward or be republished (see #15).
+            // Events without a seq (legacy relays) are always accepted.
+            let accept = match message["seq"].as_u64() {
+                Some(seq) => {
+                    let cursor = RELAY_EVENT_CURSORS
+                        .read()
+                        .unwrap()
+                        .get(relay_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if seq > cursor {
+                        RELAY_EVENT_CURSORS
+                            .write()
+                            .unwrap()
+                            .insert(relay_id.to_owned(), seq);
+                        relay.last_event_seq = seq;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => true,
+            };
+            if accept {
                 let mut event = message["event"].clone();
                 if let Some(object) = event.as_object_mut() {
                     object.insert("relay_id".to_owned(), json!(relay_id));
