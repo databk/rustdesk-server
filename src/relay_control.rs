@@ -6,12 +6,15 @@
 //! outbound-only so hbbr never exposes a management listener for aggregation.
 use crate::management;
 use hbb_common::futures_util::{sink::SinkExt as _, stream::StreamExt as _};
+use hbb_common::protobuf::Message as _;
+use hbb_common::relay_control_proto as proto;
 use hbb_common::tokio::sync::mpsc;
 use hbb_common::{anyhow::anyhow, log, tokio, ResultType};
 use reqwest::Url;
 use serde_json::{json, Value};
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     time::{Duration, Instant},
 };
 use tokio_tungstenite::{
@@ -20,6 +23,12 @@ use tokio_tungstenite::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+fn encode(msg: &proto::ControlMessage) -> Vec<u8> {
+    let mut v = Vec::new();
+    msg.write_to_vec(&mut v).ok();
+    v
+}
 
 type ControlSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -232,7 +241,7 @@ fn relay_identity() -> (String, Option<String>) {
 async fn run(
     url: &str,
     authorization: &HeaderValue,
-    events: &mut Option<mpsc::UnboundedReceiver<Value>>,
+    events: &mut Option<mpsc::UnboundedReceiver<proto::ControlMessage>>,
 ) -> ResultType<bool> {
     let mut request = url.into_client_request()?;
     request
@@ -240,20 +249,23 @@ async fn run(
         .insert("authorization", authorization.clone());
     let (mut socket, _) = tokio_tungstenite::connect_async(request).await?;
     let (id, address) = relay_identity();
-    let mut register = json!({
-        "type": "register",
-        "relay": {
-            "id": id,
-            "version": crate::version::VERSION,
-        },
-        // Tell hbbs the highest event sequence the relay has produced so a
-        // reconnect can request replay of anything hbbs missed (see #15).
-        "last_event_seq": management::last_event_seq(),
-    });
-    if let Some(address) = &address {
-        register["relay"]["address"] = json!(address);
-    }
-    socket.send(Message::Text(register.to_string())).await?;
+    let register = proto::ControlMessage {
+        payload: Some(proto::control_message::Payload::Register(proto::Register {
+            relay: Some(proto::RelayIdentity {
+                id: id.clone(),
+                version: crate::version::VERSION.to_owned(),
+                address: address.clone().unwrap_or_default(),
+                ..Default::default()
+            }).into(),
+            // Tell hbbs the highest event sequence the relay has produced so a
+            // reconnect can request replay of anything hbbs missed (see #15).
+            last_event_seq: management::last_event_seq(),
+            ..Default::default()
+        })),
+    
+        ..Default::default()
+    };
+    socket.send(Message::Binary(encode(&register))).await?;
     log::info!("Registered on the hbbs control channel as {id}");
     // Any outcome from here happened after a successful registration, so the
     // caller resets its backoff even when the loop below fails.
@@ -262,7 +274,7 @@ async fn run(
 
 async fn run_registered(
     socket: &mut ControlSocket,
-    events: &mut Option<mpsc::UnboundedReceiver<Value>>,
+    events: &mut Option<mpsc::UnboundedReceiver<proto::ControlMessage>>,
 ) -> ResultType<()> {
     let started = Instant::now();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -277,27 +289,36 @@ async fn run_registered(
                     .iter()
                     .filter_map(|s| s["bytes_per_second"].as_u64())
                     .sum();
-                let mut stats = json!({
-                    "cpu_usage": sys_stats::cpu_usage(),
-                    "mem_usage": sys_stats::mem_usage(),
-                    "active_sessions": sessions.len() as u64,
-                    "bytes_per_second": bytes_per_second,
-                });
-                if let Some(max) = max_sessions() {
-                    stats["max_sessions"] = json!(max);
-                }
-                let beat = json!({
-                    "type": "heartbeat",
-                    "uptime_seconds": started.elapsed().as_secs(),
-                    "stats": stats,
-                });
-                socket.send(Message::Text(beat.to_string())).await?;
+                let stats = proto::HostStats {
+                    cpu_usage: sys_stats::cpu_usage().unwrap_or(-1.0),
+                    mem_usage: sys_stats::mem_usage().unwrap_or(-1.0),
+                    active_sessions: sessions.len() as u64,
+                    bytes_per_second,
+                    max_sessions: max_sessions().unwrap_or(0),
+                    ..Default::default()
+                };
+                let beat = proto::ControlMessage {
+                    payload: Some(proto::control_message::Payload::Heartbeat(proto::Heartbeat {
+                        uptime_seconds: started.elapsed().as_secs(),
+                        stats: Some(stats).into(),
+                        ..Default::default()
+                    })),
+                
+        ..Default::default()
+    };
+                socket.send(Message::Binary(encode(&beat))).await?;
                 if !sessions.is_empty() {
-                    let snapshot = json!({
-                        "type": "sessions",
-                        "data": sessions,
-                    });
-                    socket.send(Message::Text(snapshot.to_string())).await?;
+                    let snapshot = proto::ControlMessage {
+                        payload: Some(proto::control_message::Payload::Sessions(
+                            proto::SessionsSnapshot {
+                                sessions: sessions.iter().map(management::session_to_proto).collect(),
+                                ..Default::default()
+                            },
+                        )),
+                    
+        ..Default::default()
+    };
+                    socket.send(Message::Binary(encode(&snapshot))).await?;
                 }
             }
             event = async {
@@ -311,25 +332,28 @@ async fn run_registered(
                     *events = None;
                     continue;
                 };
-                socket
-                    .send(Message::Text(event.to_string()))
-                    .await?;
+                socket.send(Message::Binary(encode(&event))).await?;
                 // Session lifecycle events are followed by a full snapshot so
                 // the aggregating side stays consistent without polling.
-                if event["event"]["kind"].as_str().is_some_and(|kind| {
-                    kind == "session_opened" || kind == "session_closed"
-                }) {
-                    let snapshot = json!({
-                        "type": "sessions",
-                        "data": management::sessions_snapshot(),
-                    });
-                    socket.send(Message::Text(snapshot.to_string())).await?;
-                }
+                let snapshot = proto::ControlMessage {
+                    payload: Some(proto::control_message::Payload::Sessions(
+                        proto::SessionsSnapshot {
+                            sessions: management::sessions_snapshot()
+                                .iter()
+                                .map(management::session_to_proto)
+                                .collect(),
+                            ..Default::default()
+                        },
+                    )),
+                
+        ..Default::default()
+    };
+                socket.send(Message::Binary(encode(&snapshot))).await?;
             }
             inbound = socket.next() => {
                 match inbound {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Err(err) = handle_command(&text, socket).await {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if let Err(err) = handle_command(&bytes, socket).await {
                             log::warn!("hbbs control command failed: {err}");
                         }
                     }
@@ -341,79 +365,82 @@ async fn run_registered(
     }
 }
 
-async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()> {
-    let message: Value = serde_json::from_str(text)?;
-    let id = message["id"].clone();
-    match message["type"].as_str() {
-        Some("bans") => {
-            let bans: management::Bans = serde_json::from_value(message["bans"].clone())?;
+async fn handle_command(bytes: &[u8], socket: &mut ControlSocket) -> ResultType<()> {
+    let message = proto::ControlMessage::parse_from_bytes(bytes)?;
+    match message.payload {
+        Some(proto::control_message::Payload::Bans(b)) => {
+            let bans =
+                management::bans_from_proto(b.bans.as_ref().unwrap_or(&proto::Bans::default()));
             // The aggregating hbbs owns the policy; relay-side persistence keeps
             // the policy active across relay restarts even if hbbs is down.
             management::apply_bans_update("hbbr", bans).await?;
             // Acknowledge with a dedicated ban_ack type so hbbs can track which
             // relays have applied the current policy sequence without colliding
             // with proxy request ids (see #9).
-            if !id.is_null() {
-                let ack = json!({"type": "ban_ack", "id": id});
-                socket.send(Message::Text(ack.to_string())).await?;
+            if b.id != 0 {
+                let ack = proto::ControlMessage {
+                    payload: Some(proto::control_message::Payload::BanAck(
+                        proto::BanAck {
+                            id: b.id,
+                            ..Default::default()
+                        },
+                    )),
+                
+        ..Default::default()
+    };
+                socket.send(Message::Binary(encode(&ack))).await?;
             }
         }
-        Some("get_sessions") => {
-            let snapshot = json!({
-                "type": "sessions",
-                "data": management::sessions_snapshot(),
-            });
-            socket.send(Message::Text(snapshot.to_string())).await?;
+        Some(proto::control_message::Payload::GetSessions(_)) => {
+            let snapshot = proto::ControlMessage {
+                payload: Some(proto::control_message::Payload::Sessions(
+                    proto::SessionsSnapshot {
+                        sessions: management::sessions_snapshot()
+                            .iter()
+                            .map(management::session_to_proto)
+                            .collect(),
+                        ..Default::default()
+                    },
+                )),
+            
+        ..Default::default()
+    };
+            socket.send(Message::Binary(encode(&snapshot))).await?;
         }
-        Some("disconnect") => {
-            let applied = if let Some(uuid) = message["uuid"].as_str() {
-                management::disconnect_session(uuid)
-            } else {
-                false
-            };
+        Some(proto::control_message::Payload::Disconnect(d)) => {
+            let applied = management::disconnect_session(&d.uuid);
             // Acknowledge correlated disconnect requests so hbbs HTTP handlers
             // can confirm execution instead of fire-and-forget (see #9).
-            if !id.is_null() {
-                respond(socket, &id, 200, json!({"applied": applied})).await?;
+            if d.id != 0 {
+                respond(socket, d.id, 200, json!({"applied": applied})).await?;
             }
         }
-        Some("replay_events") => {
+        Some(proto::control_message::Payload::ReplayEvents(r)) => {
             // hbbs asks the relay to re-send events hbbs missed during a
             // reconnect gap; each replayed event keeps its original seq (see #15).
-            let from_seq = message["from_seq"].as_u64().unwrap_or(0);
-            for event in management::replay_events_since(from_seq) {
-                socket.send(Message::Text(event.to_string())).await?;
-            }
-            if !id.is_null() {
-                respond(socket, &id, 200, json!({"replayed": true})).await?;
+            for event in management::replay_events_since(r.from_seq) {
+                socket.send(Message::Binary(encode(&event))).await?;
             }
         }
         // The remaining commands are proxied management requests: hbbs
         // forwards relay-scoped reads and writes and awaits the matching
         // response, so each command answers with an HTTP-equivalent status
         // and body.
-        Some("get_config") => {
-            respond(socket, &id, 200, management::config_view("hbbr")).await?;
+        Some(proto::control_message::Payload::GetConfig(g)) => {
+            respond(socket, g.id, 200, management::config_view("hbbr")).await?;
         }
-        Some("set_config") => {
-            let update = match serde_json::from_value::<management::ConfigUpdate>(json!({
-                "values": message["values"].clone()
-            })) {
-                Ok(update) => update,
-                Err(err) => {
-                    respond(socket, &id, 400, json!({"error": err.to_string()})).await?;
-                    return Ok(());
-                }
-            };
+        Some(proto::control_message::Payload::SetConfig(sc)) => {
+            let values: BTreeMap<String, String> = sc.values.into_iter().collect();
+            let update = management::ConfigUpdate { values };
             if let Some(err) = management::validate_update("hbbr", &update) {
-                respond(socket, &id, 400, json!({"error": err})).await?;
+                respond(socket, sc.id, 400, json!({"error": err})).await?;
                 return Ok(());
             }
             match management::apply_config_update("hbbr", update).await {
                 Ok((applied, pending_restart)) => {
                     respond(
                         socket,
-                        &id,
+                        sc.id,
                         200,
                         json!({"state":"saved","applied":applied,"pending_restart":pending_restart}),
                     )
@@ -421,19 +448,16 @@ async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()
                 }
                 Err(err) => {
                     log::error!("Unable to persist managed configuration: {err}");
-                    respond(socket, &id, 500, json!({"error": err.to_string()})).await?;
+                    respond(socket, sc.id, 500, json!({"error": err.to_string()})).await?;
                 }
             }
         }
-        Some("get_logs") => {
-            let tail = message["tail"]
-                .as_u64()
-                .unwrap_or(200)
-                .min(management::LOG_CAPACITY as u64) as usize;
-            respond(socket, &id, 200, management::logs_view(tail)).await?;
+        Some(proto::control_message::Payload::GetLogs(gl)) => {
+            let tail = gl.tail.min(management::LOG_CAPACITY as u64) as usize;
+            respond(socket, gl.id, 200, management::logs_view(tail)).await?;
         }
-        Some("restart") => {
-            respond(socket, &id, 202, json!({"state":"restarting"})).await?;
+        Some(proto::control_message::Payload::Restart(r)) => {
+            respond(socket, r.id, 202, json!({"state":"restarting"})).await?;
             schedule_restart();
         }
         _ => {}
@@ -445,17 +469,21 @@ async fn handle_command(text: &str, socket: &mut ControlSocket) -> ResultType<()
 // exchange by request id and forwards the status and body to its client.
 async fn respond(
     socket: &mut ControlSocket,
-    id: &Value,
+    id: u64,
     status: u16,
     body: Value,
 ) -> ResultType<()> {
-    let response = json!({
-        "type": "response",
-        "id": id,
-        "status": status,
-        "body": body,
-    });
-    socket.send(Message::Text(response.to_string())).await?;
+    let response = proto::ControlMessage {
+        payload: Some(proto::control_message::Payload::Response(proto::ControlResponse {
+            id,
+            status: status as u32,
+            body: serde_json::to_vec(&body)?.into(),
+            ..Default::default()
+        })),
+    
+        ..Default::default()
+    };
+    socket.send(Message::Binary(encode(&response))).await?;
     Ok(())
 }
 
@@ -584,13 +612,28 @@ mod tests {
             )
             .await
             .unwrap();
-            let registration = socket.next().await.unwrap().unwrap().into_text().unwrap();
-            let registration: Value = serde_json::from_str(&registration).unwrap();
-            assert_eq!(registration["type"], "register");
-            assert!(registration["relay"]["id"].is_string());
-            let heartbeat = socket.next().await.unwrap().unwrap().into_text().unwrap();
-            let heartbeat: Value = serde_json::from_str(&heartbeat).unwrap();
-            assert_eq!(heartbeat["type"], "heartbeat");
+            let registration = socket.next().await.unwrap().unwrap();
+            let registration_bytes = match registration {
+                Message::Binary(b) => b,
+                _ => panic!("expected a binary registration frame"),
+            };
+            let registration =
+                proto::ControlMessage::parse_from_bytes(&registration_bytes).unwrap();
+            assert!(matches!(
+                registration.payload,
+                Some(proto::control_message::Payload::Register(_))
+            ));
+            let heartbeat = socket.next().await.unwrap().unwrap();
+            let heartbeat_bytes = match heartbeat {
+                Message::Binary(b) => b,
+                _ => panic!("expected a binary heartbeat frame"),
+            };
+            let heartbeat =
+                proto::ControlMessage::parse_from_bytes(&heartbeat_bytes).unwrap();
+            assert!(matches!(
+                heartbeat.payload,
+                Some(proto::control_message::Payload::Heartbeat(_))
+            ));
             socket.close(None).await.unwrap();
             while let Some(message) = socket.next().await {
                 if message.unwrap().is_close() {
